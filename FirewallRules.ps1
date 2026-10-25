@@ -3,25 +3,55 @@ function Show-Menu {
     Write-Host "=== FIREWALL RULES MANAGEMENT (OSO PROJECT) ===" -ForegroundColor Cyan
     Write-Host "1. Add Inbound Rule"
     Write-Host "2. Add Outbound Rule"
-    Write-Host "3. Exit"
+    Write-Host "3. List Firewall Rules"
+    Write-Host "4. Exit"
     Write-Host "==============================================="
 }
 
 while ($true) {
     Show-Menu
-    $directionChoice = Read-Host "Select an option (1-3)"
+    $choice = Read-Host "Select an option (1-4)"
 
-    if ($directionChoice -eq '3') {
+    if ($choice -eq '4') {
         Write-Host "Exiting script..." -ForegroundColor Yellow
         break
     }
-    if ($directionChoice -notin @('1', '2')) {
+    if ($choice -notin @('1', '2', '3')) {
         Write-Host "Invalid choice. Press Enter to try again." -ForegroundColor Red
         Read-Host
         continue
     }
 
-    $direction = if ($directionChoice -eq '1') { 'Inbound' } else { 'Outbound' }
+    if ($choice -eq '3') {
+        Write-Host "`n--- Current Firewall Rules ---" -ForegroundColor Cyan
+        
+        $rules = Get-NetFirewallRule | Where-Object { $_.DisplayName -like "OSO-*" }
+        
+        if ($rules) {
+            $ruleDetails = foreach ($rule in $rules) {
+                $addressFilter = $rule | Get-NetFirewallAddressFilter
+                $portFilter = $rule | Get-NetFirewallPortFilter
+                
+                [PSCustomObject]@{
+                    DisplayName   = $rule.DisplayName
+                    Direction     = $rule.Direction
+                    Action        = $rule.Action
+                    LocalAddress  = $addressFilter.LocalAddress
+                    RemoteAddress = $addressFilter.RemoteAddress
+                    LocalPort     = $portFilter.LocalPort
+                    RemotePort    = $portFilter.RemotePort
+                }
+            }
+            $ruleDetails | Format-Table -AutoSize
+        } else {
+            Write-Host "No firewall rules found." -ForegroundColor Yellow
+        }
+        
+        Read-Host "`nPress Enter to return to the menu..."
+        continue
+    }
+
+    $direction = if ($choice -eq '1') { 'Inbound' } else { 'Outbound' }
 
     Write-Host "`n--- Rule Configuration ($direction) ---" -ForegroundColor Cyan
 
@@ -40,15 +70,15 @@ while ($true) {
     }
 
     if ([string]::IsNullOrWhiteSpace($ip) -eq $false) {
-        $parameters.Add('RemoteAddress', $ip)
+        $parameters.Add('DestinationAddress', $ip)
     }
 
     if ([string]::IsNullOrWhiteSpace($port) -eq $false) {
         $parameters.Add('Protocol', 'TCP') 
         if ($direction -eq 'Inbound') {
-            $parameters.Add('LocalPort', $port)
+            $parameters.Add('SourcePort', $port)
         } else {
-            $parameters.Add('RemotePort', $port)
+            $parameters.Add('DestinationPort', $port)
         }
     }
 
