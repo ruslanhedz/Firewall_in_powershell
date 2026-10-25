@@ -26,7 +26,7 @@ while ($true) {
     if ($choice -eq '3' -or $choice -eq '4') {
         Write-Host "`n--- Current Firewall Rules ---" -ForegroundColor Cyan
         
-        $rules = Get-NetFirewallRule | Where-Object { $_.DisplayName -match "OSO-" } | Sort-Object DisplayName
+        $rules = Get-NetFirewallRule | Where-Object { $_.DisplayName -match "OSO-" } | Sort-Object @{Expression="Action"; Descending=$true}, @{Expression="DisplayName"; Ascending=$true}
         
         if ($rules) {
             $ruleDetails = @()
@@ -45,7 +45,7 @@ while ($true) {
                     RemoteAddress = $addressFilter.RemoteAddress
                     LocalPort     = $portFilter.LocalPort
                     RemotePort    = $portFilter.RemotePort
-                    Name          = $rule.Name
+                    Name          = $rule.Name 
                 }
                 $index++
             }
@@ -75,15 +75,48 @@ while ($true) {
 
     Write-Host "`n--- Rule Configuration ($direction) ---" -ForegroundColor Cyan
 
-    $priority = Read-Host "Enter rule position/priority number (e.g., 1, 2, 3)"
-    $priNumber = 0
-    if ([int]::TryParse($priority, [ref]$priNumber)) {
-        $prefix = "{0:D2}" -f $priNumber
-    } else {
+    # Nowa logika: szukanie najwyższego użytego numeru z nazwy
+    $existingRules = Get-NetFirewallRule | Where-Object { $_.DisplayName -match "OSO-" }
+    $maxNumber = 0
+    if ($existingRules) {
+        foreach ($r in $existingRules) {
+            if ($r.DisplayName -match '^(\d+)-OSO') {
+                $num = [int]$matches[1]
+                if ($num -gt $maxNumber) { $maxNumber = $num }
+            }
+        }
+    }
+    $nextNumber = $maxNumber + 1
+    $prefix = "{0:D2}" -f $nextNumber
+
+    $ip = $null
+    while ($true) {
+        $inputIp = Read-Host "Enter IP address (or press Enter to apply to all addresses)"
+        if ([string]::IsNullOrWhiteSpace($inputIp)) {
+            break
+        }
+        if ([ipaddress]::TryParse($inputIp, [ref]$null) -and ($inputIp -match '\.' -or $inputIp -match ':')) {
+            $ip = $inputIp
+            break
+        } else {
+            Write-Host "Invalid IP address format. Please enter a valid IPv4 or IPv6 address." -ForegroundColor Red
+        }
     }
 
-    $ip = Read-Host "Enter IP address (or press Enter to apply to all addresses)"
-    $port = Read-Host "Enter port number (or press Enter to apply to all ports)"
+    $port = $null
+    while ($true) {
+        $inputPort = Read-Host "Enter port number (or press Enter to apply to all ports)"
+        if ([string]::IsNullOrWhiteSpace($inputPort)) {
+            break
+        }
+        $parsedPort = 0
+        if ([int]::TryParse($inputPort, [ref]$parsedPort) -and $parsedPort -ge 1 -and $parsedPort -le 65535) {
+            $port = $inputPort
+            break
+        } else {
+            Write-Host "Invalid port. Please enter a number between 1 and 65535." -ForegroundColor Red
+        }
+    }
     
     $actionChoice = Read-Host "Select action - [1] Allow / [2] Block"
     $action = if ($actionChoice -eq '1') { 'Allow' } else { 'Block' }
@@ -97,21 +130,21 @@ while ($true) {
     }
 
     if ([string]::IsNullOrWhiteSpace($ip) -eq $false) {
-        $parameters.Add('RemoteAddress', $ip)
+        $parameters.Add('RemoteAddress', $ip) 
     }
 
     if ([string]::IsNullOrWhiteSpace($port) -eq $false) {
         $parameters.Add('Protocol', 'TCP') 
         if ($direction -eq 'Inbound') {
-            $parameters.Add('LocalPort', $port)
+            $parameters.Add('LocalPort', $port) 
         } else {
-            $parameters.Add('RemotePort', $port)
+            $parameters.Add('RemotePort', $port) 
         }
     }
 
     Write-Host "`nCreating rule..." -ForegroundColor Yellow
     try {
-        New-NetFirewallRule @parameters | Out-Null
+        New-NetFirewallRule @parameters -ErrorAction Stop | Out-Null
         Write-Host "Success! Rule '$ruleName' has been added." -ForegroundColor Green
     } catch {
         Write-Host "Error while adding rule: $($_.Exception.Message)" -ForegroundColor Red
