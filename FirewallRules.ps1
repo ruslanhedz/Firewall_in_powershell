@@ -1,6 +1,6 @@
 function Show-Menu {
     Clear-Host
-    Write-Host "=== FIREWALL RULES MANAGEMENT (OSO PROJECT) ===" -ForegroundColor Cyan
+    Write-Host "=== FIREWALL RULES MANAGEMENT ===" -ForegroundColor Cyan
     Write-Host "1. Add Inbound Rule"
     Write-Host "2. Add Outbound Rule"
     Write-Host "3. List Firewall Rules"
@@ -75,7 +75,6 @@ while ($true) {
 
     Write-Host "`n--- Rule Configuration ($direction) ---" -ForegroundColor Cyan
 
-    # Nowa logika: szukanie najwyższego użytego numeru z nazwy
     $existingRules = Get-NetFirewallRule | Where-Object { $_.DisplayName -match "OSO-" }
     $maxNumber = 0
     if ($existingRules) {
