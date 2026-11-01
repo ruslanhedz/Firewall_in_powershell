@@ -9,8 +9,7 @@ function Show-Menu {
     Write-Host "==============================================="
 }
 
-# Asks which network profile(s) the rule should be active on.
-# Returns an array like @('Private','Public') or @('Any').
+
 function Read-ProfileChoice {
     $map = @{ '1' = 'Domain'; '2' = 'Private'; '3' = 'Public' }
 
@@ -44,9 +43,6 @@ function Read-ProfileChoice {
     }
 }
 
-# Asks which protocol the rule applies to. Returns 'TCP', 'UDP' or 'Any'.
-# If a port was given, a protocol is mandatory (Windows Firewall requires
-# TCP or UDP for port rules), so Enter defaults to TCP in that case.
 function Read-ProtocolChoice {
     param([bool]$PortSet)
 
