@@ -9,10 +9,17 @@
     Non-interactive mode used by the audit watcher (Scheduled Task, SYSTEM).
     Reconciles the live firewall policy with the audit baseline and records every
     difference (changes made outside this script) in the audit log, then exits.
+
+.PARAMETER Agent
+    Non-interactive modes of the BACKUP module (owner: Ruslan). Used only by the backup
+    server over SSH (forced command in administrators_authorized_keys) and by the rollback
+    task: Export (print the policy), Import (restore a policy through the audit wrapper),
+    Rollback (return to the pre-restore policy unless the user confirmed).
 #>
 [CmdletBinding()]
 param(
-    [switch]$SyncAudit
+    [switch]$SyncAudit,
+    [ValidateSet('Export', 'Import', 'Rollback')][string]$Agent
 )
 
 #region AUDIT
@@ -1937,6 +1944,403 @@ if ($SyncAudit) {
     }
 }
 
+# =============================================================================
+# BACKUP MODULE  (owner: Ruslan)  -  backup / restore with the central backup server
+# =============================================================================
+# * The backup server PULLS the policy from this computer over SSH (key restricted by
+#   authorized_keys to:  powershell ... -File <this script> -Agent Export | Import).
+# * Restores are PUSHED by the server to the agent (-Agent Import) after the user asked for
+#   them in menu option 9. The import runs through Invoke-AuditedChange (Operation Restore,
+#   Scope All), as the audit contract requires, so every changed rule lands in the audit log.
+# * After a restore the policy is rolled back automatically (scheduled task, -Agent Rollback)
+#   unless the user confirms within the countdown.
+# Variables and functions of this module use the prefix Bk / Bk- to avoid clashes with AUDIT.
+# =============================================================================
+#region BACKUP
+$script:BkServerIp = '10.0.2.30'
+$script:BkWork     = Join-Path $env:ProgramData 'FirewallBackup\agent'
+$script:BkAgentLog = Join-Path $script:BkWork 'agent.log'
+$script:BkFlag     = Join-Path $script:BkWork 'confirm.flag'
+
+function Write-BkLog {
+    param([string]$Text, [string]$Tag = 'agent')
+    Add-Content -Path $script:BkAgentLog -Value ("{0} [{1}] {2}" -f (Get-Date -Format 's'), $Tag, $Text)
+}
+
+function Initialize-BkWork {
+    if (-not (Test-Path -LiteralPath $script:BkWork)) {
+        New-Item -ItemType Directory -Path $script:BkWork -Force | Out-Null
+        icacls.exe $script:BkWork /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" | Out-Null
+    }
+}
+
+function Test-BkSshRule { return [bool](Get-NetFirewallRule -Name 'FWBackup-SSH-In' -ErrorAction SilentlyContinue) }
+
+# Raw creation (no audit wrapper): used INSIDE audited actions.
+function New-BkSshRule {
+    New-NetFirewallRule -Name 'FWBackup-SSH-In' -DisplayName 'FWBackup SSH from backup server' `
+        -Direction Inbound -Action Allow -Protocol TCP -LocalPort 22 -RemoteAddress $script:BkServerIp -Profile Any -ErrorAction Stop | Out-Null
+}
+
+# Audited creation: used when the rule is missing outside of a restore.
+function Ensure-BkSshRule {
+    if (Test-BkSshRule) { return }
+    [void](Invoke-AuditedChange -Operation 'Add' -Scope NewRules -Initiator 'automation' `
+        -Reason 'Backup agent: the SSH rule for the backup server was missing' -Action { New-BkSshRule })
+    Write-BkLog 'SSH rule re-created'
+}
+
+function Fail-Bk {
+    param([string]$Text)
+    $Text = ($Text -replace '[\r\n]+', ' ').Trim()
+    Write-BkLog "FAIL $Text" 'Import'
+    Write-Output 'RESULT=FAIL'
+    Write-Output "MESSAGE=$Text"
+    exit 1
+}
+
+# Entry point of the three agent modes (called by the backup server through SSH or by the rollback task).
+function Invoke-BackupAgent {
+    param([Parameter(Mandatory)][ValidateSet('Export', 'Import', 'Rollback')][string]$Agent)
+    $WarningPreference  = 'SilentlyContinue'      # stdout belongs to the protocol with the server
+    $ProgressPreference = 'SilentlyContinue'
+    $script:AuditInitiatorDefault = 'automation'
+    Initialize-BkWork
+    try {
+        switch ($Agent) {
+
+            'Export' {
+                Ensure-BkSshRule
+                $tmp = Join-Path $script:BkWork ("export_{0}.wfw" -f [guid]::NewGuid())
+                & netsh.exe advfirewall export "$tmp" | Out-Null
+                if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $tmp) -or (Get-Item -LiteralPath $tmp).Length -le 0) { throw 'netsh export failed' }
+                $bytes = [IO.File]::ReadAllBytes($tmp)
+                $hash  = (Get-FileHash -LiteralPath $tmp -Algorithm SHA256).Hash.ToLower()
+                Remove-Item -LiteralPath $tmp -Force
+                Write-Output 'FWAGENT-BEGIN'
+                Write-Output "COMPUTER=$env:COMPUTERNAME"
+                Write-Output "SHA256=$hash"
+                Write-Output "SIZE=$($bytes.Length)"
+                Write-Output 'DATA'
+                Write-Output ([Convert]::ToBase64String($bytes, [Base64FormattingOptions]::InsertLineBreaks))
+                Write-Output 'FWAGENT-END'
+                Write-BkLog "exported $($bytes.Length) bytes, sha256=$hash" 'Export'
+                exit 0
+            }
+
+            'Import' {
+                Write-BkLog 'import started' 'Import'
+                # raw bytes from stdin; stop at the FWAGENT-END marker (do not wait for end-of-stream)
+                $stdin = [Console]::OpenStandardInput()
+                $ms  = New-Object System.IO.MemoryStream
+                $buf = New-Object byte[] 65536
+                while ($true) {
+                    $task = $stdin.ReadAsync($buf, 0, $buf.Length)
+                    if (-not $task.Wait(30000)) {
+                        Write-BkLog "stdin timeout after $($ms.Length) bytes" 'Import'
+                        Fail-Bk 'timeout waiting for request data'
+                    }
+                    $n = $task.Result
+                    if ($n -le 0) { break }
+                    $ms.Write($buf, 0, $n)
+                    if ($ms.Length -gt 3MB) { Fail-Bk 'request too large' }
+                    $len  = [int]$ms.Length
+                    $tail = [Text.Encoding]::ASCII.GetString($ms.GetBuffer(), [Math]::Max(0, $len - 16), [Math]::Min(16, $len)).TrimEnd("`r", "`n")
+                    if ($tail.EndsWith('FWAGENT-END')) { break }
+                }
+                Write-BkLog "request complete: $($ms.Length) bytes" 'Import'
+                $text  = [Text.Encoding]::ASCII.GetString($ms.ToArray())
+                $lines = @($text -split "`r?`n")
+                if ($lines.Count -lt 7 -or $lines[0] -ne 'FWAGENT-BEGIN') { Fail-Bk 'bad request framing' }
+
+                $expected = (($lines | Where-Object { $_ -like 'SHA256=*' } | Select-Object -First 1) -replace '^SHA256=', '').Trim().ToLower()
+                if ($expected -notmatch '^[0-9a-f]{64}$') { Fail-Bk 'bad hash in request' }
+
+                $rbText = (($lines | Where-Object { $_ -like 'ROLLBACK_SEC=*' } | Select-Object -First 1) -replace '^ROLLBACK_SEC=', '').Trim()
+                $rbSec = 90
+                [void][int]::TryParse($rbText, [ref]$rbSec)
+                $rbSec = [Math]::Min([Math]::Max($rbSec, 30), 300)
+
+                $start = [Array]::IndexOf($lines, 'DATA')
+                $end   = [Array]::IndexOf($lines, 'FWAGENT-END')
+                if ($start -lt 0 -or $end -le ($start + 1)) { Fail-Bk 'bad data framing' }
+
+                $b64   = (($lines[($start + 1)..($end - 1)]) -join '').Trim()
+                $bytes = [Convert]::FromBase64String($b64)
+                $incoming = Join-Path $script:BkWork 'incoming.wfw'
+                [IO.File]::WriteAllBytes($incoming, $bytes)
+                $calc = (Get-FileHash -LiteralPath $incoming -Algorithm SHA256).Hash.ToLower()
+                if ($calc -ne $expected) { Remove-Item -LiteralPath $incoming -Force; Fail-Bk 'SHA-256 mismatch' }
+
+                # snapshot for the automatic rollback (fresh temp file, then replace the old snapshot)
+                $rollback = Join-Path $script:BkWork 'rollback.wfw'
+                $snapTmp  = Join-Path $script:BkWork ("snap_{0}.wfw" -f [guid]::NewGuid())
+                $snapOut  = & netsh.exe advfirewall export "$snapTmp" 2>&1
+                if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $snapTmp) -or (Get-Item -LiteralPath $snapTmp).Length -le 0) {
+                    Write-BkLog "snapshot export failed (exit $LASTEXITCODE): $($snapOut -join ' ')" 'Import'
+                    Fail-Bk 'cannot create rollback snapshot'
+                }
+                Move-Item -LiteralPath $snapTmp -Destination $rollback -Force -ErrorAction Stop
+                Remove-Item -LiteralPath $script:BkFlag -Force -ErrorAction SilentlyContinue
+
+                # The restore itself goes through the audit wrapper (Operation Restore, Scope All).
+                try {
+                    [void](Invoke-AuditedChange -Operation 'Restore' -Scope All -Initiator 'automation' `
+                        -Reason "Restore pushed by the backup server (sha256 $calc)" `
+                        -Details @{ source = 'backup-server'; sha256 = $calc; bytes = $bytes.Length; rollbackSec = $rbSec } `
+                        -Action {
+                            $impOut = & netsh.exe advfirewall import "$incoming" 2>&1
+                            if ($LASTEXITCODE -ne 0) { throw "netsh import failed (exit $LASTEXITCODE): $($impOut -join ' ')" }
+                            if (-not (Test-BkSshRule)) { New-BkSshRule }
+                        })
+                } catch {
+                    $impErr = $_.Exception.Message
+                    Write-BkLog "import failed: $impErr" 'Import'
+                    # safety first: put the previous policy back even if the audit trail is the problem
+                    & netsh.exe advfirewall import "$rollback" 2>&1 | Out-Null
+                    if (-not (Test-BkSshRule)) { try { New-BkSshRule } catch { } }
+                    Fail-Bk "import failed, previous policy restored: $impErr"
+                }
+
+                # one-shot task: rolls back unless the user confirms (confirm.flag)
+                $act = New-ScheduledTaskAction -Execute 'powershell.exe' `
+                       -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -Agent Rollback"
+                $trg = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds($rbSec)
+                $pri = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+                [void](Register-ScheduledTask -TaskName 'FwRollback' -Action $act -Trigger $trg -Principal $pri -Force -ErrorAction Stop)
+
+                Write-BkLog "imported sha256=$calc, rollback in $rbSec s" 'Import'
+                Write-Output 'RESULT=OK'
+                Write-Output "ROLLBACK_SEC=$rbSec"
+                exit 0
+            }
+
+            'Rollback' {
+                $rb = Join-Path $script:BkWork 'rollback.wfw'
+                try {
+                    if (Test-Path -LiteralPath $script:BkFlag) {
+                        Remove-Item -LiteralPath $script:BkFlag -Force
+                        Write-BkLog 'changes confirmed by user - no rollback' 'Rollback'
+                    }
+                    elseif (Test-Path -LiteralPath $rb) {
+                        try {
+                            [void](Invoke-AuditedChange -Operation 'RestoreRollback' -Scope All -Initiator 'automation' `
+                                -Reason 'No confirmation after a restore: returning to the pre-restore policy' -Action {
+                                    $rbOut = & netsh.exe advfirewall import "$rb" 2>&1
+                                    if ($LASTEXITCODE -ne 0) { throw "netsh import failed (exit $LASTEXITCODE): $($rbOut -join ' ')" }
+                                    if (-not (Test-BkSshRule)) { New-BkSshRule }
+                                })
+                            Write-BkLog 'no confirmation - policy rolled back' 'Rollback'
+                        } catch {
+                            # the rollback must happen even when the audit trail is unavailable
+                            Write-BkLog "audited rollback failed ($($_.Exception.Message)); raw import" 'Rollback'
+                            & netsh.exe advfirewall import "$rb" 2>&1 | Out-Null
+                            if (-not (Test-BkSshRule)) { try { New-BkSshRule } catch { } }
+                        }
+                    }
+                    else { Write-BkLog 'no rollback snapshot found' 'Rollback' }
+                }
+                finally {
+                    Unregister-ScheduledTask -TaskName 'FwRollback' -Confirm:$false -ErrorAction SilentlyContinue
+                }
+                exit 0
+            }
+        }
+    }
+    catch {
+        Write-BkLog "ERROR $($_.Exception.Message)" $Agent
+        if ($Agent -eq 'Import') {
+            Write-Output 'RESULT=FAIL'
+            Write-Output "MESSAGE=$(($_.Exception.Message -replace '[\r\n]+', ' '))"
+        } else {
+            [Console]::Error.WriteLine($_.Exception.Message)
+        }
+        exit 1
+    }
+}
+
+# ---- non-interactive entry point used by the backup server (SSH forced command) and the rollback task
+if ($Agent) {
+    Invoke-BackupAgent -Agent $Agent
+    exit 0
+}
+
+# ---------------------------------------------------------------- client side (menu option 9)
+$script:BkCfg = @{
+    Host           = $script:BkServerIp
+    SftpPort       = 2022                    # SFTPGo, read-only listing of backups
+    SshPort        = 22                      # backup server: backup / restore requests
+    SshUser        = 'fwbackup'
+    UserOverride   = ''                      # SFTP account; empty = Windows user name (lowercase)
+    KeyPath        = (Join-Path (Join-Path $env:USERPROFILE '.fwbackup') 'id_ed25519')
+    KnownHosts     = (Join-Path (Join-Path $env:USERPROFILE '.fwbackup') 'known_hosts')
+    WaitSec        = 120
+    RestoreWaitSec = 180
+    ConfirmFlag    = $script:BkFlag
+}
+$script:BkCfg.User = if ($script:BkCfg.UserOverride) { $script:BkCfg.UserOverride } else { $env:USERNAME.ToLower() }
+if ($script:BkCfg.User -notmatch '^[a-z0-9][a-z0-9._-]{0,31}$') {
+    Write-Host "Backup: account name '$($script:BkCfg.User)' is not allowed on the server (a-z, 0-9, . _ -). Set UserOverride in the BACKUP region." -ForegroundColor Yellow
+}
+
+function Test-ServerReachable {
+    param([int]$Port)
+    if (-not (Get-Command ssh.exe -ErrorAction SilentlyContinue) -or -not (Get-Command sftp.exe -ErrorAction SilentlyContinue)) {
+        Write-Host "ssh.exe / sftp.exe not found (install OpenSSH Client)." -ForegroundColor Yellow
+        return $false
+    }
+    if (-not (Test-Path -LiteralPath $script:BkCfg.KeyPath)) {
+        Write-Host "SSH key not found: $($script:BkCfg.KeyPath)." -ForegroundColor Yellow
+        return $false
+    }
+    $probe = Test-NetConnection -ComputerName $script:BkCfg.Host -Port $Port -WarningAction SilentlyContinue -InformationLevel Quiet
+    if (-not $probe) {
+        Write-Host "Server $($script:BkCfg.Host):$Port is unreachable." -ForegroundColor Yellow
+        return $false
+    }
+    return $true
+}
+
+# Sends one command to the backup server over SSH (forced command) and returns its KEY=VALUE answer
+function Invoke-ServerCommand {
+    param([string]$Command, [int]$TimeoutSec)
+    $key     = $script:BkCfg.KeyPath -replace '\\', '/'
+    $known   = $script:BkCfg.KnownHosts -replace '\\', '/'
+    $outFile = Join-Path $env:TEMP ("fwreq_{0}.out" -f [guid]::NewGuid())
+    $argLine = "-T -i `"$key`" -p $($script:BkCfg.SshPort) -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o `"UserKnownHostsFile=$known`" -o ConnectTimeout=10 -o ServerAliveInterval=10 $($script:BkCfg.SshUser)@$($script:BkCfg.Host) `"$Command`""
+    try {
+        $p = Start-Process -FilePath 'ssh.exe' -ArgumentList $argLine -NoNewWindow -PassThru `
+             -RedirectStandardOutput $outFile -RedirectStandardError "$outFile.err"
+        if (-not $p.WaitForExit($TimeoutSec * 1000)) {
+            try { $p.Kill() } catch { }
+            return [pscustomobject]@{ STATUS = 'FAIL'; MESSAGE = "no answer within $TimeoutSec s" }
+        }
+        $h = @{}
+        if (Test-Path -LiteralPath $outFile) {
+            Get-Content -LiteralPath $outFile | ForEach-Object { if ($_ -match '^([A-Z0-9_]+)=(.*)$') { $h[$Matches[1]] = $Matches[2] } }
+        }
+        if (-not $h.ContainsKey('STATUS')) {
+            $err = if (Test-Path -LiteralPath "$outFile.err") { "$(Get-Content -LiteralPath "$outFile.err" -Tail 1)" } else { '' }
+            $h['STATUS']  = 'FAIL'
+            $h['MESSAGE'] = "no valid answer from the server. $err"
+        }
+        return [pscustomobject]$h
+    } finally {
+        Remove-Item -LiteralPath $outFile, "$outFile.err" -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Invoke-Sftp {
+    param([string[]]$Commands)
+    $batch = Join-Path $env:TEMP ("sftp_{0}.txt" -f [guid]::NewGuid())
+    Set-Content -Path $batch -Value $Commands -Encoding ASCII
+    try {
+        $out = & sftp.exe -b $batch `
+            -i ($script:BkCfg.KeyPath -replace '\\','/') -P $script:BkCfg.SftpPort `
+            -o BatchMode=yes -o StrictHostKeyChecking=yes `
+            -o "UserKnownHostsFile=$($script:BkCfg.KnownHosts -replace '\\','/')" `
+            -o ConnectTimeout=10 "$($script:BkCfg.User)@$($script:BkCfg.Host)" 2>&1
+        [pscustomobject]@{ Ok = ($LASTEXITCODE -eq 0); Output = @($out) }
+    } catch {
+        [pscustomobject]@{ Ok = $false; Output = @($_.Exception.Message) }
+    } finally {
+        Remove-Item -LiteralPath $batch -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Request-ServerBackup {
+    param([string]$Reason = 'manual')
+    if (-not (Test-ServerReachable -Port $script:BkCfg.SshPort)) { return $false }
+    Write-Host "Asking the backup server to pull the configuration..." -ForegroundColor Cyan
+    $res = Invoke-ServerCommand -Command "backup $Reason" -TimeoutSec $script:BkCfg.WaitSec
+    if ($res.STATUS -eq 'OK') { Write-Host "Backup OK: $($res.FILE)" -ForegroundColor Green; return $true }
+    Write-Host "Backup failed: $($res.MESSAGE)" -ForegroundColor Red
+    return $false
+}
+
+# Called before a policy change (Add / Remove). A backup is NOT a policy change, so it is not audited.
+function Invoke-PreChangeBackup {
+    param([string]$Reason)
+    if (Request-ServerBackup -Reason $Reason) { return $true }
+    return ((Read-Host "Backup failed. Continue WITHOUT a backup? (yes/no) [no]").Trim().ToLower() -eq 'yes')
+}
+
+# Lists complete backups on the server (read-only SFTP account)
+function Get-ServerBackups {
+    if (-not (Test-ServerReachable -Port $script:BkCfg.SftpPort)) { return }
+    $res = Invoke-Sftp -Commands @("ls -1 backups")
+    if (-not $res.Ok) { Write-Host "Cannot read the backup list from the server." -ForegroundColor Red; return }
+    $all   = @($res.Output | ForEach-Object { ("$_" -replace '^.*/', '').Trim() })
+    $names = @($all | Where-Object { $_ -match '\.wfw$' -and ($all -contains "$_.sha256") } | Sort-Object -Descending)
+    $i = 1
+    foreach ($n in $names) {
+        $m = [regex]::Match($n, '_(\d{8})_(\d{6})_([a-z\-]+)\.wfw$')
+        $date = '?'; $reason = '?'
+        if ($m.Success) {
+            $date   = [datetime]::ParseExact("$($m.Groups[1].Value)$($m.Groups[2].Value)", 'yyyyMMddHHmmss', $null).ToString('yyyy-MM-dd HH:mm')
+            $reason = $m.Groups[3].Value
+        }
+        [pscustomobject]@{ Index = $i; Date = $date; Reason = $reason; File = $n }
+        $i++
+    }
+}
+
+function Invoke-ServerRestore {
+    $list = @(Get-ServerBackups)
+    if ($list.Count -eq 0) { Write-Host "No backups found on the server." -ForegroundColor Yellow; return }
+    $list | Format-Table Index, Date, Reason, File -AutoSize
+
+    $sel = Read-Host "Backup number to restore (Enter = cancel)"
+    $n = 0
+    if (-not ([int]::TryParse($sel, [ref]$n) -and $n -ge 1 -and $n -le $list.Count)) {
+        Write-Host "Cancelled." -ForegroundColor Yellow; return
+    }
+    $item = $list[$n - 1]
+
+    Write-Host "`nSelected backup: $($item.File)" -ForegroundColor Cyan
+    Write-Host "The server will push this backup to this computer and import it." -ForegroundColor Yellow
+    Write-Host "The import will OVERWRITE the entire current firewall policy (it is recorded in the audit log)." -ForegroundColor Yellow
+
+    $saveFirst = (Read-Host "Create a backup of the current firewall policy on the server before restoring? (yes/no) [yes]").Trim().ToLower()
+    $preVal = if ($saveFirst -eq '' -or $saveFirst -eq 'yes') { 'yes' } else { 'no' }
+
+    if ((Read-Host "Type RESTORE to confirm") -cne 'RESTORE') { Write-Host "Cancelled." -ForegroundColor Yellow; return }
+    if (-not (Test-ServerReachable -Port $script:BkCfg.SshPort)) { return }
+
+    Write-Host "Restore requested - the server is working..." -ForegroundColor Cyan
+    $res = Invoke-ServerCommand -Command "restore $($item.File) $preVal" -TimeoutSec $script:BkCfg.RestoreWaitSec
+    if ($res.STATUS -ne 'OK') { Write-Host "Restore failed: $($res.MESSAGE)" -ForegroundColor Red; return }
+
+    Write-Host "Import completed by the server." -ForegroundColor Green
+    $rb = 0
+    [void][int]::TryParse("$($res.ROLLBACK_SEC)", [ref]$rb)
+    if ($rb -le 0) { return }
+
+    $window = [Math]::Max($rb - 25, 10)
+    Write-Host "`nPress Y within $window s to KEEP the changes. Otherwise the agent rolls back automatically." -ForegroundColor Yellow
+    $keep = $false
+    try {
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        while ($sw.Elapsed.TotalSeconds -lt $window) {
+            if ([Console]::KeyAvailable) {
+                if ([Console]::ReadKey($true).Key -eq 'Y') { $keep = $true; break }
+            }
+            Write-Host -NoNewline ("`rRemaining: {0,3} s " -f [int]($window - $sw.Elapsed.TotalSeconds))
+            Start-Sleep -Milliseconds 250
+        }
+    } catch {
+        $keep = ((Read-Host "`nNo console mode. Keep the changes? (yes/no)").Trim().ToLower() -eq 'yes')
+    }
+    Write-Host ""
+    if ($keep) {
+        New-Item -ItemType File -Path $script:BkCfg.ConfirmFlag -Force | Out-Null
+        Write-Host "Changes kept (confirmation sent to the agent)." -ForegroundColor Green
+    } else {
+        Write-Host "Not confirmed - the agent will roll back to the previous policy shortly." -ForegroundColor Yellow
+    }
+}
+#endregion BACKUP
+
 function Show-Menu {
     Clear-Host
     Write-Host "=== FIREWALL RULES MANAGEMENT ===" -ForegroundColor Cyan
@@ -1948,7 +2352,8 @@ function Show-Menu {
     Write-Host "6. Verify audit log integrity"
     Write-Host "7. Sync audit now (detect changes made outside this tool)"
     Write-Host "8. Audit settings: watcher, fail policy, head hash"
-    Write-Host "9. Exit"
+    Write-Host "9. Backups: backup now / restore / list (backup server)"
+    Write-Host "10. Exit"
     Write-Host "==============================================="
     if ($script:AuditStatus) { Write-Host $script:AuditStatus.Text -ForegroundColor $script:AuditStatus.Color }
     $pol = Get-AuditPolicyStatusLine
@@ -2046,13 +2451,13 @@ $script:AuditStatus = Get-AuditWatcherSummaryLine
 
 while ($true) {
     Show-Menu
-    $choice = Read-Host "Select an option (1-9)"
+    $choice = Read-Host "Select an option (1-10)"
 
-    if ($choice -eq '9') {
+    if ($choice -eq '10') {
         Write-Host "Exiting script..." -ForegroundColor Yellow
         break
     }
-    if ($choice -notin @('1', '2', '3', '4', '5', '6', '7', '8')) {
+    if ($choice -notin @('1', '2', '3', '4', '5', '6', '7', '8', '9')) {
         Write-Host "Invalid choice. Press Enter to try again." -ForegroundColor Red
         Read-Host
         continue
@@ -2134,6 +2539,26 @@ while ($true) {
         continue
     }
 
+    if ($choice -eq '9') {
+        Write-Host "`n--- Backup server $($script:BkCfg.Host) ---" -ForegroundColor Cyan
+        $bChoice = (Read-Host "[B] Backup now   [R] Restore from a backup   [L] List backups   [Enter] Cancel").Trim().ToUpperInvariant()
+        try {
+            if ($bChoice -eq 'B') {
+                [void](Request-ServerBackup -Reason 'manual')
+            } elseif ($bChoice -eq 'R') {
+                Invoke-ServerRestore
+            } elseif ($bChoice -eq 'L') {
+                $bl = @(Get-ServerBackups)
+                if ($bl.Count -eq 0) { Write-Host "No backups found on the server." -ForegroundColor Yellow }
+                else { $bl | Format-Table Index, Date, Reason, File -AutoSize }
+            }
+        } catch {
+            Write-Host "Backup operation failed: $($_.Exception.Message)" -ForegroundColor Red
+        }
+        Read-Host "`nPress Enter to return to the menu..."
+        continue
+    }
+
     if ($choice -eq '3' -or $choice -eq '4') {
         # Show which profile(s) this machine is connected to right now
         Write-Host "`n--- Active Network Profile(s) ---" -ForegroundColor Cyan
@@ -2180,6 +2605,11 @@ while ($true) {
                 $idx = 0
                 if ([int]::TryParse($delIndex, [ref]$idx) -and $idx -ge 1 -and $idx -le $ruleDetails.Count) {
                     $ruleToDelete = $ruleDetails[$idx - 1]
+                    if (-not (Invoke-PreChangeBackup -Reason 'auto-delete')) {
+                        Write-Host "No backup - deletion aborted." -ForegroundColor Red
+                        Read-Host "`nPress Enter to return to the menu..."
+                        continue
+                    }
                     Write-Host "Deleting rule: $($ruleToDelete.DisplayName)..." -ForegroundColor Yellow
                     try {
                         # Audited: intent -> snapshot before/after -> change + result records.
@@ -2286,6 +2716,12 @@ while ($true) {
         } else {
             $parameters.Add('RemotePort', $port)
         }
+    }
+
+    if (-not (Invoke-PreChangeBackup -Reason 'auto-add')) {
+        Write-Host "No backup - adding the rule aborted." -ForegroundColor Red
+        Read-Host "`nPress Enter to return to the menu..."
+        continue
     }
 
     Write-Host "`nCreating rule..." -ForegroundColor Yellow
