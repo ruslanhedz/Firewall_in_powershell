@@ -63,6 +63,7 @@ $script:AuditMutexName     = 'Global\FirewallAuditLog'
 $script:AuditMaxBytes      = 10MB
 $script:AuditTaskPath      = '\FirewallAudit\'
 $script:AuditTaskName      = 'Watcher'
+$script:AuditWatcherIntervalMin = 15      # periodic sync: the event trigger can miss events (log full/disabled/cleared)
 $script:AuditEventLog      = 'Microsoft-Windows-Windows Firewall With Advanced Security/Firewall'
 # Event IDs differ between Windows builds (2004/2005/2006/2033 on older ones, 2097/2099/2052/2059
 # observed on Windows 11 24H2). All known IDs are listed on purpose.
@@ -75,7 +76,27 @@ $script:AuditEventIds      = @{
 }
 $script:AuditPolicyHive    = [Microsoft.Win32.Registry]::LocalMachine
 $script:AuditPolicyPath    = 'SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy'
+# Group Policy store (same hive); absent on machines without a firewall GPO.
+$script:AuditGpoPath       = 'SOFTWARE\Policies\Microsoft\WindowsFirewall'
 $script:AuditProfileKeys   = [ordered]@{ Domain = 'DomainProfile'; Private = 'StandardProfile'; Public = 'PublicProfile' }
+# Top-level subkeys of the policy roots that have their own handlers (everything else is walked generically).
+$script:AuditHandledTopKeys = @('FirewallRules', 'ConSecRules', 'DomainProfile', 'StandardProfile', 'PublicProfile')
+# Registry keys (relative, wildcard) excluded from the generic walk because they change on their own.
+# Empty on purpose: "visibility over everything". Every entry needs a written rationale and is logged in
+# the 'baseline' record (ignoredKeys).
+$script:AuditIgnoreKeys    = @()
+# Who may own / write the audit directory. Tests add the current user via AuditTrustedExtra.
+$script:AuditTrustedSids   = @('S-1-5-18', 'S-1-5-32-544')
+$script:AuditTrustedExtra  = @()
+$script:AuditInInit        = $false
+$script:AuditNotices       = @()
+$script:AuditLockTimeoutMs = 60000
+# Last resort for fail-open markers when pending.jsonl cannot be written: the Application event log.
+$script:AuditEventLogFallback = $true
+$script:AuditSettingsTamperNoted = $false
+$script:AuditRotatedNameRegex = '^audit-\d{8}-\d{9}(-\d+)?\.jsonl$'
+# Baseline file schema: 2 = rules + ConSec + GPO + generic settings. Older baselines are rebuilt silently.
+$script:AuditBaselineSchema = 2
 $script:AuditZeroHash      = '0' * 64
 $script:AuditSelfPath      = $PSCommandPath
 $script:AuditInitiatorDefault = $null
@@ -96,26 +117,89 @@ $script:AuditConsumedKeys  = [System.Collections.Generic.HashSet[string]]::new(
 # ---------------------------------------------------------------- small helpers
 
 function Get-AuditFile {
-    param([ValidateSet('Log', 'Baseline', 'Bin')][string]$Kind = 'Log')
+    param([ValidateSet('Log', 'Baseline', 'Bin', 'State')][string]$Kind = 'Log')
     switch ($Kind) {
+        'State'    { Join-Path $script:AuditDir 'state.json' }
         'Log'      { Join-Path $script:AuditDir 'audit.jsonl' }
         'Baseline' { Join-Path $script:AuditDir 'baseline.json' }
         'Bin'      { Join-Path $script:AuditDir 'bin' }
     }
 }
 
-function Initialize-AuditStore {
-    if (-not (Test-Path -LiteralPath $script:AuditDir)) {
-        New-Item -ItemType Directory -Path $script:AuditDir -Force -ErrorAction Stop | Out-Null
+# ----------------------------------------------- the audit directory must not be writable by users
+# C:\ProgramData lets every user create files and folders. The audit directory therefore gets its own
+# protected ACL, and an existing directory is checked (and repaired) on EVERY use: a user could have
+# pre-created it, and then could delete or replace the log and the baseline.
+
+function Get-AuditTrustedSids {
+    $sids = [System.Collections.Generic.List[string]]::new()
+    foreach ($s in @($script:AuditTrustedSids) + @($script:AuditTrustedExtra)) { if ($s) { $sids.Add([string]$s) } }
+    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+    # an elevated administrator (not necessarily as the Administrators group) may own what it creates
+    if ((New-Object Security.Principal.WindowsPrincipal($id)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        $sids.Add($id.User.Value)
     }
+    return $sids.ToArray()
 }
 
-# All log files, oldest first (rotated files first, the live file last).
+# Pure check of a DirectorySecurity: trusted owner, and nobody untrusted may write/create/delete/change ACLs.
+function Test-AuditDirSecurity {
+    param([Parameter(Mandatory)][System.Security.AccessControl.DirectorySecurity]$Acl)
+    $trusted = Get-AuditTrustedSids
+    $issues = [System.Collections.Generic.List[string]]::new()
+    $owner = $Acl.GetOwner([Security.Principal.SecurityIdentifier])
+    $ownerSid = if ($owner) { $owner.Value } else { '' }
+    $ownerOk = $trusted -contains $ownerSid
+    $mask = [Security.AccessControl.FileSystemRights]'WriteData, AppendData, WriteExtendedAttributes, WriteAttributes, Delete, DeleteSubdirectoriesAndFiles, ChangePermissions, TakeOwnership'
+    foreach ($r in $Acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+        if ($r.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) { continue }
+        if ($trusted -contains $r.IdentityReference.Value) { continue }
+        $bad = $r.FileSystemRights -band $mask
+        if ([int]$bad -ne 0) { $issues.Add("$($r.IdentityReference.Value) is allowed: $bad") }
+    }
+    return [pscustomobject]@{ Ok = ($ownerOk -and $issues.Count -eq 0); OwnerTrusted = $ownerOk; Owner = $ownerSid; Issues = $issues.ToArray() }
+}
+
+function New-AuditSecureAcl {
+    $acl = New-Object System.Security.AccessControl.DirectorySecurity
+    $acl.SetAccessRuleProtection($true, $false)       # no inheritance from ProgramData
+    $flags = [Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+    $none = [Security.AccessControl.PropagationFlags]::None
+    $allow = [Security.AccessControl.AccessControlType]::Allow
+    $sids = @($script:AuditTrustedSids) + @($script:AuditTrustedExtra) | Where-Object { $_ } | Select-Object -Unique
+    foreach ($s in $sids) {
+        $sid = New-Object Security.Principal.SecurityIdentifier($s)
+        $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($sid, [Security.AccessControl.FileSystemRights]::FullControl, $flags, $none, $allow)))
+    }
+    return $acl
+}
+
+function Initialize-AuditStore {
+    if ($script:AuditInInit) { return }
+    $script:AuditInInit = $true
+    try {
+        if (-not (Test-Path -LiteralPath $script:AuditDir)) {
+            [void][IO.Directory]::CreateDirectory($script:AuditDir, (New-AuditSecureAcl))
+            return
+        }
+        $info = New-Object IO.DirectoryInfo($script:AuditDir)
+        $check = Test-AuditDirSecurity -Acl $info.GetAccessControl()
+        if ($check.Ok) { return }
+        if (-not $check.OwnerTrusted) {
+            throw "Audit directory $($script:AuditDir) is owned by $($check.Owner), who is not SYSTEM/Administrators (a user may have pre-created it). Remove it as an administrator and run again."
+        }
+        $info.SetAccessControl((New-AuditSecureAcl))
+        $script:AuditNotices += ,([ordered]@{ issue = 'audit-dir-acl-repaired'; detail = "Untrusted access removed from $($script:AuditDir): $($check.Issues -join '; ')" })
+    } finally { $script:AuditInInit = $false }
+}
+
+# All log files, oldest first (rotated files first, the live file last). Only strictly named files count;
+# anything else called audit-* is reported by Test-AuditLogIntegrity.
 function Get-AuditFiles {
     if (-not (Test-Path -LiteralPath $script:AuditDir)) { return @() }
     $files = @()
     $files += @(Get-ChildItem -LiteralPath $script:AuditDir -Filter 'audit-*.jsonl' -File -ErrorAction SilentlyContinue |
-        Sort-Object Name | ForEach-Object { $_.FullName })
+        Where-Object { $_.Name -match $script:AuditRotatedNameRegex } | Sort-Object Name | ForEach-Object { $_.FullName })
     $live = Get-AuditFile 'Log'
     if (Test-Path -LiteralPath $live) { $files += $live }
     return $files
@@ -254,7 +338,7 @@ function Resolve-AuditSid {
 # One named mutex serialises everything that writes the audit log or the baseline
 # (menu instances, the SYSTEM watcher task, other modules). Re-entrant per thread.
 function Enter-AuditLock {
-    param([int]$TimeoutMs = 60000)
+    param([int]$TimeoutMs = $script:AuditLockTimeoutMs)
     if ($script:AuditLockDepth -gt 0) { $script:AuditLockDepth++; return }
     if ($null -eq $script:AuditMutex) {
         $script:AuditMutex = New-Object System.Threading.Mutex($false, $script:AuditMutexName)
@@ -448,37 +532,107 @@ function Get-PolicySnapshot {
         $Reuse
     )
     $snap = [ordered]@{}
-    if ($Scope -in 'All', 'Rules', 'Names') {
-        $k = Open-AuditPolicyKey 'FirewallRules'
-        if ($k) {
-            try {
-                $list = if ($Scope -eq 'Names') { $Names } else { $k.GetValueNames() }
-                foreach ($n in $list) {
-                    if ([string]::IsNullOrEmpty($n)) { continue }
-                    $raw = $k.GetValue($n, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
-                    if ($null -eq $raw) { continue }
-                    $raw = [string]$raw
-                    $key = "rule:$n"
-                    if ($null -ne $RawSink) { $RawSink[$key] = $raw }
-                    if ($Reuse -and (Test-AuditKey $Reuse.Raws $key) -and (Test-AuditKey $Reuse.Entries $key) -and
-                        ([string]$Reuse.Raws[$key] -ceq $raw)) {
-                        $snap[$key] = $Reuse.Entries[$key]
-                    } else {
-                        $snap[$key] = ConvertFrom-AuditRuleString $raw
-                    }
-                }
-            } finally { $k.Close() }
-        }
+    $pol = $script:AuditPolicyPath
+    $gpo = $script:AuditGpoPath
+
+    if ($Scope -eq 'Names') {
+        Add-AuditRuleStrings -Snap $snap -Prefix 'rule' -Path "$pol\FirewallRules" -Names $Names -RawSink $RawSink -Reuse $Reuse
+        return $snap
+    }
+    if ($Scope -in 'All', 'Rules') {
+        Add-AuditRuleStrings -Snap $snap -Prefix 'rule'      -Path "$pol\FirewallRules" -RawSink $RawSink -Reuse $Reuse
+        Add-AuditRuleStrings -Snap $snap -Prefix 'consec'    -Path "$pol\ConSecRules"   -RawSink $RawSink -Reuse $Reuse
+        Add-AuditRuleStrings -Snap $snap -Prefix 'gporule'   -Path "$gpo\FirewallRules" -RawSink $RawSink -Reuse $Reuse
+        Add-AuditRuleStrings -Snap $snap -Prefix 'gpoconsec' -Path "$gpo\ConSecRules"   -RawSink $RawSink -Reuse $Reuse
     }
     if ($Scope -in 'All', 'Profiles') {
         foreach ($p in $script:AuditProfileKeys.Keys) {
-            $pk = Open-AuditPolicyKey $script:AuditProfileKeys[$p]
+            $pk = $script:AuditPolicyHive.OpenSubKey("$pol\$($script:AuditProfileKeys[$p])")
             if ($pk) {
                 try { $snap["profile:$p"] = Get-AuditProfileEntry $pk } finally { $pk.Close() }
             }
+            $gk = $script:AuditPolicyHive.OpenSubKey("$gpo\$($script:AuditProfileKeys[$p])")
+            if ($gk) {
+                try { $snap["gpoprofile:$p"] = Get-AuditProfileEntry $gk } finally { $gk.Close() }
+            }
         }
     }
+    if ($Scope -eq 'All') {
+        Add-AuditGenericKeys -Snap $snap -Prefix 'setting'    -RootPath $pol -RawSink $RawSink -Reuse $Reuse
+        Add-AuditGenericKeys -Snap $snap -Prefix 'gposetting' -RootPath $gpo -RawSink $RawSink -Reuse $Reuse
+    }
     return $snap
+}
+
+# Values 'name = data' of one registry value-string family (rules or connection security rules).
+function Add-AuditRuleStrings {
+    param($Snap, [string]$Prefix, [string]$Path, [string[]]$Names, [hashtable]$RawSink, $Reuse)
+    $k = $script:AuditPolicyHive.OpenSubKey($Path)
+    if (-not $k) { return }
+    try {
+        $list = if ($PSBoundParameters.ContainsKey('Names')) { $Names } else { $k.GetValueNames() }
+        foreach ($n in $list) {
+            if ([string]::IsNullOrEmpty($n)) { continue }
+            $raw = $k.GetValue($n, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+            if ($null -eq $raw) { continue }
+            $raw = [string]$raw
+            $key = "${Prefix}:$n"
+            if ($null -ne $RawSink) { $RawSink[$key] = $raw }
+            if ($Reuse -and (Test-AuditKey $Reuse.Raws $key) -and (Test-AuditKey $Reuse.Entries $key) -and
+                ([string]$Reuse.Raws[$key] -ceq $raw)) {
+                $Snap[$key] = $Reuse.Entries[$key]
+            } else {
+                $Snap[$key] = ConvertFrom-AuditRuleString $raw
+            }
+        }
+    } finally { $k.Close() }
+}
+
+function Test-AuditIgnoredKey {
+    param([string]$Key)
+    foreach ($pattern in $script:AuditIgnoreKeys) { if ($Key -like $pattern) { return $true } }
+    return $false
+}
+
+# Every registry key below RootPath (except the families that have their own handlers) becomes ONE entry
+# 'Prefix:relative\path' holding all its values. Catches global settings, Mdm, Hyper-V, RestrictedServices,
+# DynamicKeywords, ... without knowing their format.
+function Add-AuditGenericKeys {
+    param($Snap, [string]$Prefix, [string]$RootPath, [hashtable]$RawSink, $Reuse)
+    $stack = [System.Collections.Generic.Stack[string]]::new()
+    $stack.Push('')
+    while ($stack.Count -gt 0) {
+        $rel = $stack.Pop()
+        $path = if ($rel) { "$RootPath\$rel" } else { $RootPath }
+        $k = $null
+        try { $k = $script:AuditPolicyHive.OpenSubKey($path) } catch { continue }
+        if (-not $k) { continue }
+        try {
+            $key = "${Prefix}:" + $(if ($rel) { $rel } else { '.' })
+            if (-not (Test-AuditIgnoredKey $key)) {
+                $sb = [System.Text.StringBuilder]::new()
+                $vals = [ordered]@{}
+                foreach ($v in ($k.GetValueNames() | Sort-Object)) {
+                    $name = if ($v -eq '') { '(default)' } else { $v }
+                    $text = ConvertTo-AuditRegistryText ($k.GetValue($v, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames))
+                    $vals[$name] = $text
+                    [void]$sb.Append($name).Append('=').Append($text).Append("`n")
+                }
+                $raw = $sb.ToString()
+                if ($null -ne $RawSink) { $RawSink[$key] = $raw }
+                if ($Reuse -and (Test-AuditKey $Reuse.Raws $key) -and (Test-AuditKey $Reuse.Entries $key) -and
+                    ([string]$Reuse.Raws[$key] -ceq $raw)) {
+                    $Snap[$key] = $Reuse.Entries[$key]
+                } else {
+                    $Snap[$key] = $vals
+                }
+            }
+            foreach ($s in $k.GetSubKeyNames()) {
+                if (-not $rel -and ($script:AuditHandledTopKeys -contains $s)) { continue }
+                $stack.Push($(if ($rel) { "$rel\$s" } else { $s }))
+            }
+        } finally { $k.Close() }
+    }
 }
 
 # Integrity hash of the baseline FILE content (entries + raw strings), exactly as it is serialised.
@@ -740,6 +894,11 @@ function Write-AuditRecord {
         if ((Test-Path -LiteralPath $log) -and (Get-Item -LiteralPath $log).Length -ge $script:AuditMaxBytes) {
             Invoke-AuditRotation
         }
+        while ($script:AuditNotices.Count -gt 0) {
+            $notice = $script:AuditNotices[0]
+            $script:AuditNotices = @($script:AuditNotices | Select-Object -Skip 1)
+            [void](Add-AuditLine -Type 'integrity' -Initiator $Initiator -Fields $notice)
+        }
         $tail = Get-AuditTail
         if ($tail.TrailingInvalid -gt 0) {
             [void](Add-AuditLine -Type 'integrity' -Initiator $Initiator -Fields ([ordered]@{
@@ -763,8 +922,10 @@ function Read-AuditBaseline {
         foreach ($k in $obj['entries'].Keys) { $entries[[string]$k] = $obj['entries'][$k] }
         $raws = [ordered]@{}
         if ($obj.ContainsKey('raws')) { foreach ($k in $obj['raws'].Keys) { $raws[[string]$k] = [string]$obj['raws'][$k] } }
+        $schema = 1
+        if ($obj.ContainsKey('v')) { $schema = [int]$obj['v'] }
         return [pscustomobject]@{
-            Corrupt = $false; Entries = $entries; Raws = $raws
+            Corrupt = $false; Entries = $entries; Raws = $raws; Schema = $schema
             StoredHash = [string]$obj['hash']; Ts = (ConvertTo-AuditDate $obj['ts'])
         }
     } catch {
@@ -776,7 +937,7 @@ function Save-AuditBaseline {
     param($Entries, $Raws, [string]$Hash, [DateTime]$Ts)
     $path = Get-AuditFile 'Baseline'
     $obj = [ordered]@{
-        v = 1; ts = $Ts.ToUniversalTime().ToString('o', [Globalization.CultureInfo]::InvariantCulture)
+        v = $script:AuditBaselineSchema; ts = $Ts.ToUniversalTime().ToString('o', [Globalization.CultureInfo]::InvariantCulture)
         hash = $Hash; count = $Entries.Count; entries = $Entries; raws = $Raws
     }
     $json = (New-AuditSerializer).Serialize($obj)
@@ -790,7 +951,8 @@ function Save-AuditBaseline {
 # the hash stored in the log. Caller must hold the lock.
 function Get-AuditBaselineState {
     $loaded = Read-AuditBaseline
-    if ($loaded -and -not $loaded.Corrupt) {
+    $upgrade = [bool]($loaded -and -not $loaded.Corrupt -and $loaded.Schema -lt $script:AuditBaselineSchema)
+    if ($loaded -and -not $loaded.Corrupt -and -not $upgrade) {
         $computed = Get-AuditBaselineHash -Entries $loaded.Entries -Raws $loaded.Raws
         if ($loaded.StoredHash -ne $computed) {
             [void](Write-AuditRecord -Type 'integrity' -Fields ([ordered]@{
@@ -808,7 +970,7 @@ function Get-AuditBaselineState {
         return [pscustomobject]@{ Entries = $loaded.Entries; Raws = $loaded.Raws; Ts = $loaded.Ts; Created = $false }
     }
 
-    $why = if ($null -eq $loaded) { 'missing' } else { "corrupt: $($loaded.Error)" }
+    $why = if ($upgrade) { 'schema-upgrade' } elseif ($null -eq $loaded) { 'missing' } else { "corrupt: $($loaded.Error)" }
     $ts = [DateTime]::UtcNow
     $raws = @{}
     $snap = Get-PolicySnapshot -Scope All -RawSink $raws
@@ -816,7 +978,9 @@ function Get-AuditBaselineState {
     foreach ($k in ($raws.Keys | Sort-Object)) { $rawOrdered[$k] = $raws[$k] }
     $hash = Get-AuditBaselineHash -Entries $snap -Raws $rawOrdered
     [void](Write-AuditRecord -Type 'baseline' -Fields ([ordered]@{
-        reason = $why; ruleCount = $rawOrdered.Count; profileCount = ($snap.Count - $rawOrdered.Count)
+        reason = $why; schema = $script:AuditBaselineSchema; objectCount = $snap.Count
+        ruleCount = @($snap.Keys | Where-Object { $_.StartsWith('rule:') }).Count
+        ignoredKeys = [string[]]@($script:AuditIgnoreKeys)
         baselineHash = $hash
     }))
     Save-AuditBaseline -Entries $snap -Raws $rawOrdered -Hash $hash -Ts $ts
@@ -871,12 +1035,14 @@ function Get-AuditEventIndex {
 }
 
 function New-AuditEventActor {
-    param($Event)
-    return [ordered]@{
+    param($Event, [string]$Evidence = 'eventlog', [string]$Confidence = '')
+    $a = [ordered]@{
         user = (Resolve-AuditSid $Event.Sid); sid = $Event.Sid; application = $Event.App
-        evidence = 'eventlog'; eventId = $Event.Id
+        evidence = $Evidence; eventId = $Event.Id
         eventTime = $Event.Time.ToString('o', [Globalization.CultureInfo]::InvariantCulture)
     }
+    if ($Confidence) { $a['confidence'] = $Confidence }
+    return $a
 }
 
 # Returns key -> actor for the given diff items.
@@ -897,9 +1063,12 @@ function Resolve-AuditActors {
                 $ev = if ($match.Count -gt 0) { $match[-1] } else { $cands[-1] }
                 $actor = New-AuditEventActor $ev
             } elseif ($it.Op -eq 'Removed' -and $idx.AllDeleted.Count -gt 0) {
-                $actor = New-AuditEventActor $idx.AllDeleted[-1]
+                # one 'delete all' event, many removed rules: a correlation guess, never proof
+                $actor = New-AuditEventActor $idx.AllDeleted[-1] -Evidence 'bulk-delete-correlation' -Confidence 'low'
             }
-        } elseif ($idx.Settings.Count -gt 0) {
+        } elseif ((Get-AuditKeyFamily $it.Key).Gpo) {
+            $actor = $null   # Group Policy changes are applied by the policy engine; the key location is the evidence
+        } elseif ($idx.Settings.Count -gt 0 -and (Get-AuditKeyFamily $it.Key).Shape -ne 'rule') {
             $pairs = @($idx.Settings | ForEach-Object { "$($_.Sid)|$($_.App)" } | Sort-Object -Unique)
             if ($pairs.Count -eq 1) { $actor = New-AuditEventActor $idx.Settings[-1] }
         }
@@ -918,43 +1087,76 @@ function Resolve-AuditActors {
     return $result
 }
 
-# source = who/what made the change: 'oso' (this tool), 'system' (Windows itself), 'external'.
+# Describes a snapshot key: Kind (as written in the log), Shape (rule|profile|setting), Gpo (Group Policy store).
+function Get-AuditKeyFamily {
+    param([string]$Key)
+    $prefix = $Key.Substring(0, [Math]::Max(0, $Key.IndexOf(':')))
+    switch ($prefix) {
+        'rule'       { return [pscustomobject]@{ Kind = 'rule';        Shape = 'rule';    Gpo = $false } }
+        'consec'     { return [pscustomobject]@{ Kind = 'consec';      Shape = 'rule';    Gpo = $false } }
+        'gporule'    { return [pscustomobject]@{ Kind = 'gpo-rule';    Shape = 'rule';    Gpo = $true } }
+        'gpoconsec'  { return [pscustomobject]@{ Kind = 'gpo-consec';  Shape = 'rule';    Gpo = $true } }
+        'profile'    { return [pscustomobject]@{ Kind = 'profile';     Shape = 'profile'; Gpo = $false } }
+        'gpoprofile' { return [pscustomobject]@{ Kind = 'gpo-profile'; Shape = 'profile'; Gpo = $true } }
+        'gposetting' { return [pscustomobject]@{ Kind = 'gpo-setting'; Shape = 'setting'; Gpo = $true } }
+        default      { return [pscustomobject]@{ Kind = 'setting';     Shape = 'setting'; Gpo = $false } }
+    }
+}
+
+# Applications whose changes under a system account are treated as Windows itself (MpsSvc runs in svchost).
+# SYSTEM running powershell.exe / netsh.exe / cmd.exe is NOT Windows: it is 'external'.
+$script:AuditSystemApps = @('svchost.exe', 'services.exe', 'lsass.exe')
+
+function Test-AuditSystemActor {
+    param($Actor)
+    $sid = [string]$Actor.sid
+    $app = [string]$Actor.application
+    $sysSid = ($sid -in @('S-1-5-18', 'S-1-5-19', 'S-1-5-20')) -or $sid.StartsWith('S-1-5-80-')
+    if (-not $sysSid -or $app.Length -eq 0) { return $false }
+    foreach ($name in $script:AuditSystemApps) {
+        if ($app -ieq (Join-Path $env:SystemRoot "System32\$name")) { return $true }
+    }
+    return $false
+}
+
+# source = what made the change:
+#   gpo      the key lives in the Group Policy store (decided by the registry location, not by a name)
+#   system   event log proves a system account AND an allow-listed Windows service binary
+#   external anything else (GUI, netsh, other admins, SYSTEM running a shell, unknown). 'oso' is set by the wrapper.
+# A name that looks like a Windows resource string ('@FirewallAPI.dll,-1') is NOT evidence: anybody can use it.
 function Get-AuditChangeSource {
     param($Item, $Actor)
-    if ($Actor.evidence -eq 'eventlog') {
-        $sid = [string]$Actor.sid
-        $app = [string]$Actor.application
-        $sysSid = ($sid -in @('S-1-5-18', 'S-1-5-19', 'S-1-5-20')) -or $sid.StartsWith('S-1-5-80-')
-        $inWin = ($app.Length -gt 0) -and $app.StartsWith($env:SystemRoot, [StringComparison]::OrdinalIgnoreCase)
-        if ($sysSid -and $inWin) { return 'system' }
-        return 'external'
-    }
-    $entry = if ($Item.After) { $Item.After } else { $Item.Before }
-    foreach ($f in 'displayName', 'displayGroup') {
-        if ((Test-AuditKey $entry $f) -and ([string]$entry[$f]).StartsWith('@')) { return 'system' }
-    }
+    if ((Get-AuditKeyFamily $Item.Key).Gpo) { return 'gpo' }
+    if ($Actor.evidence -eq 'eventlog' -and (Test-AuditSystemActor $Actor)) { return 'system' }
     return 'external'
 }
 
 function Write-AuditChange {
-    param($Item, [string]$Detection, [string]$Source, $Actor, [string]$TxId, [string]$Initiator, [string[]]$Related = @())
-    $isRule = $Item.Key.StartsWith('rule:')
+    param($Item, [string]$Detection, [string]$Source, $Actor, [string]$TxId, [string]$Initiator, [string[]]$Related = @(), [string]$Attribution = '')
+    $family = Get-AuditKeyFamily $Item.Key
     $id = $Item.Key.Substring($Item.Key.IndexOf(':') + 1)
     $entry = if ($Item.After) { $Item.After } else { $Item.Before }
     $f = [ordered]@{
         op = $Item.Op
-        kind = $(if ($isRule) { 'rule' } else { 'profile' })
+        kind = $family.Kind
     }
-    if ($isRule) {
-        $f['ruleId'] = $id
-        $dn = [string]$entry['displayName']
-        $f['displayName'] = $dn
-        if ($dn.StartsWith('@')) { $f['displayNameResolved'] = Resolve-AuditResourceString $dn }
-    } else {
-        $f['profile'] = $id
+    switch ($family.Shape) {
+        'rule' {
+            $f['ruleId'] = $id
+            $dn = [string]$entry['displayName']
+            $f['displayName'] = $dn
+            if ($dn.StartsWith('@')) {
+                $f['displayNameResolved'] = Resolve-AuditResourceString $dn
+                # a hint only: anyone can name a rule like a Windows resource string
+                if ($f['displayNameResolved'] -ne $dn) { $f['hint'] = 'builtin-resource-name' }
+            }
+        }
+        'profile' { $f['profile'] = $id }
+        default   { $f['path'] = $id }
     }
     $f['source'] = $Source
     $f['detection'] = $Detection
+    if ($Attribution) { $f['attribution'] = $Attribution }
     $f['actor'] = $Actor
     $f['before'] = $Item.Before
     $f['after'] = $Item.After
@@ -965,6 +1167,138 @@ function Write-AuditChange {
 
 # ------------------------------------------------------- the audited-change wrapper
 
+# ------------------------------------------------ fail policy (settings.json) and pending markers
+
+function Get-AuditSettingsPath { Join-Path $script:AuditDir 'settings.json' }
+function Get-AuditPendingPath  { Join-Path $script:AuditDir 'pending.jsonl' }
+
+function Get-AuditSettingsHash {
+    param([string]$Policy, [string]$Ts, [string]$By)
+    return Get-AuditSha256Hex "v=1|failPolicy=$Policy|ts=$Ts|by=$By"
+}
+
+# Effective fail policy. Only a settings file that is consistent with the audit log can turn it to Open;
+# anything suspicious (edited file, missing log entry, unreadable file) means Closed.
+function Get-AuditFailPolicy {
+    $res = [pscustomobject]@{ Policy = 'Closed'; Source = 'default'; Tampered = $false; Unverified = $false }
+    try {
+        $path = Get-AuditSettingsPath
+        if (-not (Test-Path -LiteralPath $path)) { return $res }
+        $o = ConvertFrom-Json -InputObject ([IO.File]::ReadAllText($path, $script:AuditUtf8))
+        $res.Source = 'file'
+        if ([string]$o.failPolicy -ne 'Open') { return $res }
+        $ok = ([string]$o.hash -eq (Get-AuditSettingsHash -Policy 'Open' -Ts ([string]$o.ts) -By ([string]$o.by)))
+        if ($ok) {
+            $logReadable = $true
+            try { $rec = Find-AuditRecordFromEnd -Predicate { param($x) $x.type -eq 'setting' } -MaxFiles 3 } catch { $logReadable = $false }
+            if ($logReadable) {
+                $ok = [bool]($rec -and [string]$rec.Obj.settingsHash -eq [string]$o.hash -and [string]$rec.Obj.newValue -eq 'Open')
+            } else {
+                # The log cannot be read right now - which is exactly when fail-open matters. A self-consistent
+                # file is accepted but marked Unverified; the next sync cross-checks it against the log.
+                $res.Unverified = $true
+            }
+        }
+        if ($ok) { $res.Policy = 'Open'; return $res }
+        $res.Tampered = $true; $res.Source = 'tampered'
+    } catch {
+        $res.Tampered = $true; $res.Source = 'unreadable'
+    }
+    if ($res.Tampered -and -not $script:AuditSettingsTamperNoted) {
+        $script:AuditSettingsTamperNoted = $true
+        $script:AuditNotices += ,([ordered]@{ issue = 'settings-file-modified'; detail = 'settings.json asks for fail-open but does not match the audit log (edited or unreadable); fail-closed is used.' })
+    }
+    return $res
+}
+
+# Changes the persisted fail policy. The change is written to the audit log FIRST (so it is attributable and
+# the file can be cross-checked), then to settings.json.
+function Set-AuditFailPolicy {
+    param([Parameter(Mandatory)][ValidateSet('Closed', 'Open')][string]$Policy, [string]$Reason)
+    Enter-AuditLock
+    try {
+        Initialize-AuditStore
+        $old = (Get-AuditFailPolicy).Policy
+        $ts = Get-AuditTimestamp
+        $by = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+        $hash = Get-AuditSettingsHash -Policy $Policy -Ts $ts -By $by
+        [void](Write-AuditRecord -Type 'setting' -Fields ([ordered]@{
+            setting = 'failPolicy'; oldValue = $old; newValue = $Policy; settingsHash = $hash; reason = $Reason
+        }))
+        $path = Get-AuditSettingsPath
+        $json = ConvertTo-AuditJson ([ordered]@{ v = 1; failPolicy = $Policy; ts = $ts; by = $by; hash = $hash })
+        $tmp = "$path.tmp"
+        [IO.File]::WriteAllText($tmp, $json, $script:AuditUtf8)
+        if (Test-Path -LiteralPath $path) { [IO.File]::Replace($tmp, $path, [NullString]::Value) } else { [IO.File]::Move($tmp, $path) }
+        $script:AuditSettingsTamperNoted = $false
+    } finally { Exit-AuditLock }
+}
+
+# Marker for a change that was performed while the audit trail was unavailable (fail-open).
+function Add-AuditPending {
+    param([string]$TxId, [string]$Operation, [string]$Scope, [string[]]$Names, [string]$Reason, [string]$Why)
+    $rec = [ordered]@{
+        ts = Get-AuditTimestamp; txid = $TxId; operation = $Operation; scope = $Scope
+        names = [string[]]@($Names); reason = $Reason; why = $Why
+        user = [Security.Principal.WindowsIdentity]::GetCurrent().Name; pid = $PID
+    }
+    $line = (ConvertTo-AuditJson $rec) + "`n"
+    $done = $false
+    try {
+        [IO.File]::AppendAllText((Get-AuditPendingPath), $line, $script:AuditUtf8)
+        $done = $true
+    } catch { }
+    if (-not $done -and $script:AuditEventLogFallback) {
+        try {
+            if (-not [Diagnostics.EventLog]::SourceExists('FirewallAudit')) { New-EventLog -LogName Application -Source 'FirewallAudit' }
+            [Diagnostics.EventLog]::WriteEntry('FirewallAudit', "UNLOGGED firewall change (fail-open): $line", [Diagnostics.EventLogEntryType]::Warning, 4001)
+        } catch { }
+    }
+}
+
+function Read-AuditPending {
+    $path = Get-AuditPendingPath
+    if (-not (Test-Path -LiteralPath $path)) { return @() }
+    $out = @()
+    foreach ($l in [IO.File]::ReadAllLines($path, $script:AuditUtf8)) {
+        if ($l.Trim() -eq '') { continue }
+        try { $out += ,(ConvertFrom-Json -InputObject $l) } catch { $out += ,([pscustomobject]@{ txid = ''; operation = '?'; why = "unparsable marker: $l" }) }
+    }
+    return @($out)
+}
+
+function Write-AuditPendingRecords {
+    param($Pending)
+    foreach ($p in @($Pending)) {
+        [void](Write-AuditRecord -Type 'integrity' -TxId ([string]$p.txid) -Fields ([ordered]@{
+            issue = 'unlogged-change'
+            detail = "A change ($($p.operation), scope $($p.scope)) was performed without an audit trail (fail-open): $($p.why). Real changes, if they could be detected, are recorded as reconcile/watcher changes."
+            markerTs = $p.ts; markerUser = $p.user; operation = $p.operation; names = $p.names; reason = $p.reason
+        }))
+    }
+}
+
+# Removes the first $Count markers (the ones that were just processed); markers added meanwhile stay.
+function Clear-AuditPending {
+    param([int]$Count)
+    $path = Get-AuditPendingPath
+    if (-not (Test-Path -LiteralPath $path)) { return }
+    $lines = @([IO.File]::ReadAllLines($path, $script:AuditUtf8) | Where-Object { $_.Trim() -ne '' })
+    $rest = @($lines | Select-Object -Skip $Count)
+    if ($rest.Count -eq 0) { Remove-Item -LiteralPath $path -Force } else { [IO.File]::WriteAllLines($path, $rest, $script:AuditUtf8) }
+}
+
+# Is this diff item what the caller DECLARED it would change? Anything else is a 'scope-escape'.
+function Test-AuditInScope {
+    param($Item, [string]$Scope, [string[]]$Names)
+    switch ($Scope) {
+        'All'      { return $true }
+        'Profiles' { return $Item.Key.StartsWith('profile:') }
+        'NewRules' { return ($Item.Op -eq 'Added' -and ($Item.Key.StartsWith('rule:') -or $Item.Key.StartsWith('consec:'))) }
+        default    { foreach ($n in $Names) { if ($Item.Key -ceq "rule:$n") { return $true } }; return $false }
+    }
+}
+
 function Invoke-AuditedChange {
     [CmdletBinding()]
     param(
@@ -974,36 +1308,48 @@ function Invoke-AuditedChange {
         [Parameter(Mandatory)][scriptblock]$Action,
         [string]$Initiator,
         [string]$Reason,
-        [System.Collections.IDictionary]$Details
+        [System.Collections.IDictionary]$Details,
+        # What to do when the audit trail cannot be written BEFORE the change:
+        #   Closed  the change is NOT performed (default; the audit guarantee wins)
+        #   Open    the change is performed, a marker is queued and the next sync reconciles it
+        #   Default follow the persisted setting (menu 8 -> [F]); Closed when there is none
+        [ValidateSet('Default', 'Closed', 'Open')][string]$FailPolicy = 'Default'
     )
     $auditErr = $null
     $auditOut = $null
-    Enter-AuditLock
+    $auditTx = [guid]::NewGuid().ToString()
+    $auditWarn = @()
+    $auditDiff = @()
+    $auditLogErr = $null
+    $auditFailOpen = $false
+    $auditPrepErr = $null
+    $auditPolicy = if ($FailPolicy -eq 'Default') { (Get-AuditFailPolicy).Policy } else { $FailPolicy }
+
+    try { Enter-AuditLock } catch {
+        $auditPrepErr = $_.Exception.Message
+        if ($auditPolicy -ne 'Open') { throw "Audit log unavailable - the change was NOT performed. $auditPrepErr" }
+        $auditFailOpen = $true
+    }
     try {
         # Everything up to and including the write-ahead 'intent' record is the PREPARE phase:
-        # if any of it fails (log unwritable, corrupt, locked...) the change is NOT executed.
-        try {
+        # if any of it fails (log unwritable, corrupt, locked...) the change is NOT executed
+        # (fail-closed) unless the fail policy is Open.
+        if (-not $auditFailOpen) {
+          try {
             Initialize-AuditStore
-            $auditTx = [guid]::NewGuid().ToString()
             $auditWatch = [Diagnostics.Stopwatch]::StartNew()
             $auditBl = Get-AuditBaselineState
             $auditEntries = $auditBl.Entries
 
-            # ---- state before the change
-            $auditPreNames = $null
+            # ---- state before the change: the WHOLE policy (unchanged objects are reused from the
+            # baseline, so this costs about a second). -Scope only says which changes are EXPECTED.
             $auditRawBefore = @{}
-            switch ($Scope) {
-                'Names'    { $auditBefore = Get-PolicySnapshot -Scope Names -Names $Names -RawSink $auditRawBefore }
-                'NewRules' { $auditPreNames = Get-PolicyRuleNames; $auditBefore = [ordered]@{} }
-                'Profiles' { $auditBefore = Get-PolicySnapshot -Scope Profiles }
-                'All'      { $auditBefore = Get-PolicySnapshot -Scope All -RawSink $auditRawBefore -Reuse $auditBl }
-            }
+            $auditBefore = Get-PolicySnapshot -Scope All -RawSink $auditRawBefore -Reuse $auditBl
 
             # ---- write-ahead record
-            $auditWarn = @()
             if ($Details -and $Details.Contains('expectedDisplayName') -and $Scope -eq 'Names' -and $Names.Count -eq 1) {
                 $auditKey = "rule:$($Names[0])"
-                if (-not $auditBefore.Contains($auditKey)) {
+                if (-not (Test-AuditKey $auditBefore $auditKey)) {
                     $auditWarn += 'rule no longer exists at execution time'
                 } elseif ([string]$auditBefore[$auditKey]['displayName'] -ne [string]$Details['expectedDisplayName']) {
                     $auditWarn += "rule changed since it was listed (expected '$($Details['expectedDisplayName'])', found '$($auditBefore[$auditKey]['displayName'])')"
@@ -1014,18 +1360,8 @@ function Invoke-AuditedChange {
                 reason = $Reason; details = $Details; warnings = [string[]]@($auditWarn)
             }))
 
-            # ---- drift: changes made behind our back to the objects we are about to touch
-            $auditSub = [ordered]@{}
-            switch ($Scope) {
-                'Names' {
-                    foreach ($auditN in $Names) { if ($auditEntries.Contains("rule:$auditN")) { $auditSub["rule:$auditN"] = $auditEntries["rule:$auditN"] } }
-                }
-                'Profiles' {
-                    foreach ($auditK in @($auditEntries.Keys)) { if ($auditK.StartsWith('profile:')) { $auditSub[$auditK] = $auditEntries[$auditK] } }
-                }
-                'All' { $auditSub = $auditEntries }
-            }
-            $auditDrift = @(Compare-PolicySnapshot -Before $auditSub -After $auditBefore)
+            # ---- drift: ANY change made behind our back since the last baseline (not only the objects we touch)
+            $auditDrift = @(Compare-PolicySnapshot -Before $auditEntries -After $auditBefore)
             if ($auditDrift.Count -gt 0) {
                 $auditSince = if ($auditBl.Ts) { $auditBl.Ts.AddSeconds(-120) } else { [DateTime]::UtcNow.AddDays(-7) }
                 $auditActors = Resolve-AuditActors -Items $auditDrift -Since $auditSince
@@ -1036,35 +1372,42 @@ function Invoke-AuditedChange {
                 }
                 Update-AuditEntries -Entries $auditEntries -Raws $auditBl.Raws -Items $auditDrift -RawSource $auditRawBefore
             }
-        } catch {
-            throw "Audit log unavailable - the change was NOT performed. $($_.Exception.Message)"
+          } catch {
+            $auditPrepErr = $_.Exception.Message
+            if ($auditPolicy -ne 'Open') { throw "Audit log unavailable - the change was NOT performed. $auditPrepErr" }
+            $auditFailOpen = $true
+          }
+        }
+
+        if ($auditFailOpen) {
+            # Fail-open: queue a marker (the next sync turns it into an integrity record), warn loudly, go on.
+            Add-AuditPending -TxId $auditTx -Operation $Operation -Scope $Scope -Names $Names -Reason $Reason -Why $auditPrepErr
+            $auditWarn += "audit trail unavailable, change performed anyway (fail policy Open): $auditPrepErr"
+            Write-Warning "AUDIT FAIL-OPEN: the audit trail is unavailable ($auditPrepErr). The change is performed and will be reconciled by the next audit sync."
         }
 
         # ---- the change itself
         try { $auditOut = & $Action } catch { $auditErr = $_ }
 
         # ---- state after the change; the log reflects what REALLY changed
+        if (-not $auditFailOpen) {
         $auditSnapTime = [DateTime]::UtcNow
         $auditRawAfter = @{}
-        switch ($Scope) {
-            'Names'    { $auditAfter = Get-PolicySnapshot -Scope Names -Names $Names -RawSink $auditRawAfter }
-            'NewRules' {
-                $auditSeen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-                foreach ($auditN in $auditPreNames) { [void]$auditSeen.Add($auditN) }
-                $auditNew = @((Get-PolicyRuleNames) | Where-Object { -not $auditSeen.Contains($_) })
-                $auditAfter = Get-PolicySnapshot -Scope Names -Names $auditNew -RawSink $auditRawAfter
-            }
-            'Profiles' { $auditAfter = Get-PolicySnapshot -Scope Profiles }
-            'All'      { $auditAfter = Get-PolicySnapshot -Scope All -RawSink $auditRawAfter -Reuse $auditBl }
-        }
+        $auditAfter = Get-PolicySnapshot -Scope All -RawSink $auditRawAfter -Reuse $auditBl
         $auditDiff = @(Compare-PolicySnapshot -Before $auditBefore -After $auditAfter)
+        $auditEscapes = @($auditDiff | Where-Object { -not (Test-AuditInScope -Item $_ -Scope $Scope -Names $Names) })
 
-        $auditLogErr = $null
         try {
             $auditActor = Get-AuditScriptActor -Initiator $Initiator
             foreach ($auditD in $auditDiff) {
-                Write-AuditChange -Item $auditD -Detection 'script' -Source 'oso' -Actor $auditActor `
-                    -TxId $auditTx -Initiator $Initiator
+                $auditEsc = $auditEscapes -contains $auditD
+                $auditFam = Get-AuditKeyFamily $auditD.Key
+                Write-AuditChange -Item $auditD -Detection $(if ($auditEsc) { 'scope-escape' } else { 'script' }) `
+                    -Source $(if ($auditFam.Gpo) { 'gpo' } else { 'oso' }) -Actor $auditActor `
+                    -Attribution $(if ($auditEsc) { 'inferred-window' } else { '' }) -TxId $auditTx -Initiator $Initiator
+            }
+            if ($auditEscapes.Count -gt 0) {
+                $auditWarn += "$($auditEscapes.Count) change(s) outside the declared scope '$Scope' (logged as scope-escape)"
             }
             Update-AuditEntries -Entries $auditEntries -Raws $auditBl.Raws -Items $auditDiff -RawSource $auditRawAfter
             $auditBh = Get-AuditBaselineHash -Entries $auditEntries -Raws $auditBl.Raws
@@ -1077,7 +1420,9 @@ function Invoke-AuditedChange {
                     removed = @($auditDiff | Where-Object Op -eq 'Removed').Count
                     modified = @($auditDiff | Where-Object Op -eq 'Modified').Count
                     drift = $auditDrift.Count
+                    scopeEscapes = $auditEscapes.Count
                 }
+                warnings = [string[]]@($auditWarn)
                 durationMs = [int]$auditWatch.ElapsedMilliseconds
                 baselineHash = $auditBh
             }))
@@ -1089,6 +1434,7 @@ function Invoke-AuditedChange {
             Write-Warning ("AUDIT: the change was applied but its audit record could not be completed ($auditLogErr). " +
                 'It will be recovered by the next audit sync.')
         }
+        }   # end of: if (-not $auditFailOpen)
     } finally { Exit-AuditLock }
 
     if ($auditErr) { throw $auditErr }
@@ -1097,7 +1443,7 @@ function Invoke-AuditedChange {
         Added = @($auditDiff | Where-Object Op -eq 'Added').Count
         Removed = @($auditDiff | Where-Object Op -eq 'Removed').Count
         Modified = @($auditDiff | Where-Object Op -eq 'Modified').Count
-        AuditWarning = $auditLogErr; Warnings = $auditWarn
+        AuditWarning = $auditLogErr; Warnings = $auditWarn; FailOpen = $auditFailOpen
     }
 }
 
@@ -1130,12 +1476,20 @@ function Invoke-AuditSync {
     [CmdletBinding()]
     param([ValidateSet('manual', 'startup', 'task')][string]$Trigger = 'manual', [switch]$Quiet)
 
-    $summary = [pscustomobject]@{ Created = $false; Added = 0; Removed = 0; Modified = 0; Recovered = 0; Total = 0 }
+    $summary = [pscustomobject]@{ Created = $false; Added = 0; Removed = 0; Modified = 0; Recovered = 0; Total = 0; Pending = 0 }
     Enter-AuditLock
     try {
         Initialize-AuditStore
+        [void](Get-AuditFailPolicy)          # cross-checks settings.json against the log; a mismatch becomes a notice
         $auditBl = Get-AuditBaselineState
         if ($auditBl.Created) {
+            # the baseline is taken from the CURRENT policy, so earlier unlogged changes can only be reported as markers
+            $auditPendingNow = @(Read-AuditPending)
+            if ($auditPendingNow.Count -gt 0) {
+                Write-AuditPendingRecords $auditPendingNow
+                Clear-AuditPending -Count $auditPendingNow.Count
+                $summary.Pending = $auditPendingNow.Count
+            }
             $summary.Created = $true
             $summary.Total = $auditBl.Entries.Count
             if (-not $Quiet) { Write-Host "Audit baseline created ($($auditBl.Entries.Count) policy objects)." -ForegroundColor Green }
@@ -1157,7 +1511,10 @@ function Invoke-AuditSync {
                 note = 'No result was recorded (process interrupted?). Real changes, if any, are recorded below as reconcile/watcher detections.'
             }))
         }
-        $auditRelated = [string[]]@($auditDangling | ForEach-Object { [string]$_.txid })
+        # changes performed while the audit trail was unavailable (fail-open): one integrity record each
+        $auditPending = @(Read-AuditPending)
+        Write-AuditPendingRecords $auditPending
+        $auditRelated = [string[]]@(@($auditDangling | ForEach-Object { [string]$_.txid }) + @($auditPending | ForEach-Object { [string]$_.txid }) | Where-Object { $_ })
         $auditDet = if ($Trigger -eq 'task') { 'watcher' } else { 'reconcile' }
         foreach ($auditD in $auditDiff) {
             $auditA = $auditActors[$auditD.Key]
@@ -1174,7 +1531,7 @@ function Invoke-AuditSync {
         $summary.Recovered = $auditDangling.Count
         $summary.Total = $auditCurrent.Count
 
-        if ($auditDiff.Count -gt 0 -or $auditDangling.Count -gt 0 -or $Trigger -eq 'manual') {
+        if ($auditDiff.Count -gt 0 -or $auditDangling.Count -gt 0 -or $auditPending.Count -gt 0 -or $Trigger -eq 'manual') {
             $unattributed = @($auditDiff | Where-Object { $auditActors[$_.Key].evidence -ne 'eventlog' }).Count
             [void](Write-AuditRecord -Type 'sync' -TxId $auditTx -Fields ([ordered]@{
                 trigger = $Trigger
@@ -1188,6 +1545,8 @@ function Invoke-AuditSync {
             }))
             Save-AuditBaseline -Entries $auditCurrent -Raws $auditRawOrdered -Hash $auditBh -Ts $auditSnapTime
         }
+        if ($auditPending.Count -gt 0) { Clear-AuditPending -Count $auditPending.Count }
+        $summary.Pending = $auditPending.Count
     } finally { Exit-AuditLock }
 
     if (-not $Quiet) {
@@ -1202,12 +1561,40 @@ function Invoke-AuditSync {
 
 function Test-AuditLogIntegrity {
     [CmdletBinding()]
-    param([switch]$Quiet)
+    param([switch]$Quiet, [string]$ExpectedHead)
     $errors = New-Object System.Collections.Generic.List[string]
     $warnings = New-Object System.Collections.Generic.List[string]
     $files = @(Get-AuditFiles)
     $prevHash = $null; $prevSeq = $null; $prevTs = $null
     $total = 0
+
+    # A head noted earlier ('seq:hash', see Get-AuditHeadHash) is the only defence against truncation and
+    # against a complete, self-consistent rewrite of the log.
+    $expSeq = $null; $expHash = $null; $headFound = $false
+    if ($ExpectedHead) {
+        $hm = [regex]::Match($ExpectedHead.Trim(), '^(\d+):([0-9a-fA-F]{64})$')
+        if ($hm.Success) { $expSeq = [long]$hm.Groups[1].Value; $expHash = $hm.Groups[2].Value.ToLowerInvariant() }
+        else { $errors.Add("the saved head must look like <seq>:<64 hex characters>, got '$ExpectedHead'") }
+    }
+
+    if (Test-Path -LiteralPath $script:AuditDir) {
+        foreach ($it in @(Get-ChildItem -LiteralPath $script:AuditDir -Force -ErrorAction SilentlyContinue)) {
+            $n = $it.Name
+            if ($n -like 'audit*' -and $n -ne 'audit.jsonl' -and $n -notmatch $script:AuditRotatedNameRegex) {
+                $errors.Add("unexpected file in the audit directory: $n (it is not part of the chain)")
+            } elseif ($n -like '*.tmp') {
+                $warnings.Add("stale temporary file in the audit directory: $n")
+            }
+        }
+        try {
+            $sec = Test-AuditDirSecurity -Acl ((New-Object IO.DirectoryInfo($script:AuditDir)).GetAccessControl())
+            if (-not $sec.Ok) {
+                $why = @($sec.Issues)
+                if (-not $sec.OwnerTrusted) { $why += "owner is $($sec.Owner)" }
+                $errors.Add("audit directory is not protected: $($why -join '; ')")
+            }
+        } catch { $warnings.Add("cannot check the audit directory ACL: $($_.Exception.Message)") }
+    }
 
     foreach ($f in $files) {
         $leaf = Split-Path -Leaf $f
@@ -1235,12 +1622,20 @@ function Test-AuditLogIntegrity {
                     }
                     if ($seq -ne $prevSeq + 1) { $errors.Add("${leaf}:${lineNo} sequence gap (expected $($prevSeq + 1), found $seq)") }
                 }
+                if ($null -ne $expSeq -and $seq -eq $expSeq) {
+                    $headFound = $true
+                    if ($p.Hash -ne $expHash) { $errors.Add("saved head mismatch: record seq $seq has hash $($p.Hash), expected $expHash (log replaced or rewritten)") }
+                }
                 $ts = ConvertTo-AuditDate $o.ts
                 if ($prevTs -and $ts -and $ts -lt $prevTs) { $warnings.Add("${leaf}:${lineNo} timestamp goes backwards (clock changed?)") }
                 $prevHash = $p.Hash; $prevSeq = $seq; $prevTs = $ts
                 $firstInFile = $false
             }
         } finally { $sr.Dispose() }
+    }
+
+    if ($null -ne $expSeq -and -not $headFound) {
+        $errors.Add("saved head seq $expSeq not found: the log was truncated (last seq here: $prevSeq) or replaced")
     }
 
     $result = [pscustomobject]@{
@@ -1260,10 +1655,19 @@ function Test-AuditLogIntegrity {
         $warnings | Select-Object -First 10 | ForEach-Object { Write-Host "  ! $_" -ForegroundColor Yellow }
         if ($total -gt 0) {
             Write-Host "Chain head: seq=$prevSeq hash=$prevHash"
-            Write-Host '(Note the head: removal of the newest records can only be detected by comparing it with an earlier note.)' -ForegroundColor DarkGray
+            Write-Host '(Note the head OFF this machine: cut-off records or a full rewrite are only detected by comparing it with a saved head. Submenu 8 -> [H].)' -ForegroundColor DarkGray
         }
     }
     return $result
+}
+
+# Newest valid record as 'seq:hash'. Store it OFF this machine (mail it to yourself, ticket, paper):
+# the unkeyed hash chain cannot prove that records were not cut off or the whole log rewritten.
+function Get-AuditHeadHash {
+    $f = Find-AuditRecordFromEnd -MaxFiles 1
+    if ($null -eq $f) { return $null }
+    $seq = [long]$f.Obj.seq
+    return [pscustomobject]@{ Seq = $seq; Hash = $f.Hash; Ts = [string]$f.Obj.ts; Text = "${seq}:$($f.Hash)" }
 }
 
 function Read-AuditRecords {
@@ -1300,8 +1704,8 @@ function Show-AuditLog {
         switch (Read-Host 'Operation filter: [1] Added  [2] Removed  [3] Modified  (Enter = any)') {
             '1' { $op = 'Added' } '2' { $op = 'Removed' } '3' { $op = 'Modified' }
         }
-        switch (Read-Host 'Source filter: [1] oso (this tool)  [2] system  [3] external  (Enter = any)') {
-            '1' { $src = 'oso' } '2' { $src = 'system' } '3' { $src = 'external' }
+        switch (Read-Host 'Source filter: [1] oso (this tool)  [2] system  [3] external  [4] gpo  (Enter = any)') {
+            '1' { $src = 'oso' } '2' { $src = 'system' } '3' { $src = 'external' } '4' { $src = 'gpo' }
         }
     }
     $since = [DateTime]::UtcNow.AddDays(-$days)
@@ -1314,7 +1718,9 @@ function Show-AuditLog {
         $time = (ConvertTo-AuditDate $r.ts).ToLocalTime().ToString('yyyy-MM-dd HH:mm:ss')
         switch ($r.type) {
             'change' {
-                $name = if ($r.kind -eq 'rule') { if ($r.displayNameResolved) { $r.displayNameResolved } else { $r.displayName } } else { "profile $($r.profile)" }
+                $name = if ($r.ruleId) { if ($r.displayNameResolved) { $r.displayNameResolved } else { $r.displayName } }
+                        elseif ($r.profile) { "$($r.kind) $($r.profile)" }
+                        else { "$($r.kind) $($r.path)" }
                 $detail = if ($r.op -eq 'Modified') { (@($r.changes) | ForEach-Object { $_.field }) -join ',' } else { '' }
                 [pscustomobject]@{ Seq = $r.seq; Time = $time; Type = 'change'; Op = $r.op; Source = $r.source; Target = $name; By = $r.actor.user; How = $r.detection; Detail = $detail }
             }
@@ -1342,23 +1748,76 @@ function Get-AuditLatestEventRecordId {
 # Entry point of the Scheduled Task (-SyncAudit): wait until the event burst settles, sync,
 # and repeat if new events appeared during the sync.
 function Invoke-AuditWatcherRun {
-    $deadline = (Get-Date).AddSeconds(30)
-    $stable = 0
-    $last = Get-AuditLatestEventRecordId
-    while ($stable -lt 3 -and (Get-Date) -lt $deadline) {
-        Start-Sleep -Seconds 1
-        $cur = Get-AuditLatestEventRecordId
-        if ($cur -eq $last) { $stable++ } else { $stable = 0; $last = $cur }
-    }
-    for ($i = 0; $i -lt 3; $i++) {
-        $mark = Get-AuditLatestEventRecordId
-        [void](Invoke-AuditSync -Trigger task -Quiet)
-        if ((Get-AuditLatestEventRecordId) -eq $mark) { break }
+    param([int]$SettleSeconds = 30)
+    $started = Get-AuditTimestamp
+    try {
+        $deadline = (Get-Date).AddSeconds($SettleSeconds)
+        $stable = 0
+        $last = Get-AuditLatestEventRecordId
+        while ($stable -lt 3 -and (Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 1
+            $cur = Get-AuditLatestEventRecordId
+            if ($cur -eq $last) { $stable++ } else { $stable = 0; $last = $cur }
+        }
+        $summary = $null
+        for ($i = 0; $i -lt 3; $i++) {
+            $mark = Get-AuditLatestEventRecordId
+            $summary = Invoke-AuditSync -Trigger task -Quiet
+            if ((Get-AuditLatestEventRecordId) -eq $mark) { break }
+        }
+        Write-AuditState -Status 'ok' -Started $started -Summary $summary
+    } catch {
+        Write-AuditState -Status 'failed' -Started $started -Message $_.Exception.Message
+        throw
     }
 }
 
+# state.json: outcome of the last watcher run. It is how the menu notices a watcher that is "installed"
+# but no longer doing anything (task disabled, script broken, errors on every run).
+function Write-AuditState {
+    param([ValidateSet('ok', 'failed')][string]$Status, [string]$Started, $Summary, [string]$Message)
+    try {
+        $o = [ordered]@{
+            v = 1; status = $Status; started = $Started; finished = (Get-AuditTimestamp)
+            user = [Security.Principal.WindowsIdentity]::GetCurrent().Name; message = $Message
+        }
+        if ($Summary) { $o.summary = [ordered]@{ added = $Summary.Added; removed = $Summary.Removed; modified = $Summary.Modified; pending = $Summary.Pending } }
+        # keep the time of the last SUCCESS even when later runs fail
+        $prev = Read-AuditState
+        $o.lastOk = if ($Status -eq 'ok') { $o.finished } elseif ($prev) { [string]$prev.lastOk } else { $null }
+        $path = Get-AuditFile 'State'
+        $tmp = "$path.tmp"
+        [IO.File]::WriteAllText($tmp, (ConvertTo-AuditJson $o), $script:AuditUtf8)
+        if (Test-Path -LiteralPath $path) { [IO.File]::Replace($tmp, $path, [NullString]::Value) } else { [IO.File]::Move($tmp, $path) }
+    } catch { }
+}
+
+function Read-AuditState {
+    try {
+        $path = Get-AuditFile 'State'
+        if (-not (Test-Path -LiteralPath $path)) { return $null }
+        return (ConvertFrom-Json -InputObject ([IO.File]::ReadAllText($path, $script:AuditUtf8)))
+    } catch { return $null }
+}
+
+# 'Healthy' | 'NeverRan' | 'Failed' | 'Stale' - pure function of state.json and the clock (testable).
+function Get-AuditWatcherHealth {
+    param($State, [datetime]$NowUtc = [DateTime]::UtcNow)
+    if (-not $State) { return [pscustomobject]@{ Health = 'NeverRan'; LastOk = $null; Message = 'the watcher has not completed a run yet' } }
+    $lastOk = $null
+    if ($State.lastOk) { $lastOk = ConvertTo-AuditDate ([string]$State.lastOk) }
+    if ([string]$State.status -eq 'failed') {
+        return [pscustomobject]@{ Health = 'Failed'; LastOk = $lastOk; Message = [string]$State.message }
+    }
+    $limit = [TimeSpan]::FromMinutes($script:AuditWatcherIntervalMin * 3)
+    if (-not $lastOk -or ($NowUtc - $lastOk) -gt $limit) {
+        return [pscustomobject]@{ Health = 'Stale'; LastOk = $lastOk; Message = "no successful run for more than $([int]$limit.TotalMinutes) minutes" }
+    }
+    return [pscustomobject]@{ Health = 'Healthy'; LastOk = $lastOk; Message = $null }
+}
+
 function Get-AuditWatcherStatus {
-    $st = [ordered]@{ Installed = $false; State = $null; LastRun = $null; LastResult = $null; UpToDate = $null; EventLog = $null }
+    $st = [ordered]@{ Installed = $false; State = $null; LastRun = $null; LastResult = $null; UpToDate = $null; EventLog = $null; Health = $null }
     try {
         $t = Get-ScheduledTask -TaskPath $script:AuditTaskPath -TaskName $script:AuditTaskName -ErrorAction Stop
         $info = Get-ScheduledTaskInfo -InputObject $t
@@ -1371,6 +1830,7 @@ function Get-AuditWatcherStatus {
             $h = (Get-FileHash -LiteralPath $installed -Algorithm SHA256).Hash.ToLowerInvariant()
             $st.UpToDate = ($h -eq (Get-AuditSelfHash))
         } else { $st.UpToDate = $false }
+        $st.Health = Get-AuditWatcherHealth -State (Read-AuditState)
     } catch { }
     try {
         $l = Get-WinEvent -ListLog $script:AuditEventLog -ErrorAction Stop
@@ -1386,6 +1846,13 @@ function Get-AuditWatcherSummaryLine {
     $color = 'Green'
     if ($s.State -ne 'Ready' -and $s.State -ne 'Running') { $txt += ' (task is not active!)'; $color = 'Red' }
     if ($s.UpToDate -eq $false) { $txt += ' - installed copy differs from this script, reinstall it'; $color = 'Yellow' }
+    if ($s.Health) {
+        switch ($s.Health.Health) {
+            'Failed'   { $txt += " - LAST RUN FAILED: $($s.Health.Message)"; $color = 'Red' }
+            'Stale'    { $txt += " - $($s.Health.Message)"; $color = 'Red' }
+            'NeverRan' { $txt += ' - has not completed a run yet'; if ($color -eq 'Green') { $color = 'Yellow' } }
+        }
+    }
     if ($s.EventLog -and -not $s.EventLog.enabled) { $txt += ' - firewall event log disabled: no "who" for external changes'; $color = 'Yellow' }
     return @{ Text = $txt; Color = $color }
 }
@@ -1418,6 +1885,16 @@ function Install-AuditWatcher {
         throw 'The installed copy does not match the source script.'
     }
 
+    $def = New-AuditWatcherDefinition -ScriptPath $installed
+    Register-ScheduledTask -TaskPath $script:AuditTaskPath -TaskName $script:AuditTaskName -Action $def.Action `
+        -Trigger $def.Triggers -Principal $def.Principal -Settings $def.Settings -Force `
+        -Description 'Records firewall policy changes made outside firewall.ps1 (audit watcher).' | Out-Null
+}
+
+# Everything the Scheduled Task consists of, without registering it (so it can be inspected and tested
+# without administrator rights). Triggers: firewall change events, system start, and a periodic safety net.
+function New-AuditWatcherDefinition {
+    param([Parameter(Mandatory)][string]$ScriptPath)
     $ids = @($script:AuditEventIds.Values | ForEach-Object { $_ }) | Sort-Object -Unique
     $cond = ($ids | ForEach-Object { "EventID=$_" }) -join ' or '
     $sub = "<QueryList><Query Id=`"0`" Path=`"$($script:AuditEventLog)`"><Select Path=`"$($script:AuditEventLog)`">*[System[($cond)]]</Select></Query></QueryList>"
@@ -1426,15 +1903,17 @@ function Install-AuditWatcher {
     $evTrigger.Subscription = $sub
     $evTrigger.Enabled = $true
     $startTrigger = New-ScheduledTaskTrigger -AtStartup
+    $periodic = New-ScheduledTaskTrigger -Once -At ((Get-Date).Date) -RepetitionInterval (New-TimeSpan -Minutes $script:AuditWatcherIntervalMin)
 
-    $psArg = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$installed`" -SyncAudit"
+    $psArg = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$ScriptPath`" -SyncAudit"
     $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $psArg
     $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
     $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -StartWhenAvailable `
         -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 10)
-    Register-ScheduledTask -TaskPath $script:AuditTaskPath -TaskName $script:AuditTaskName -Action $action `
-        -Trigger @($evTrigger, $startTrigger) -Principal $principal -Settings $settings -Force `
-        -Description 'Records firewall policy changes made outside firewall.ps1 (audit watcher).' | Out-Null
+    return [pscustomobject]@{
+        Triggers = @($evTrigger, $startTrigger, $periodic); Action = $action; Principal = $principal; Settings = $settings
+        Subscription = $sub; IntervalMinutes = $script:AuditWatcherIntervalMin
+    }
 }
 
 function Uninstall-AuditWatcher {
@@ -1468,10 +1947,29 @@ function Show-Menu {
     Write-Host "5. View audit log"
     Write-Host "6. Verify audit log integrity"
     Write-Host "7. Sync audit now (detect changes made outside this tool)"
-    Write-Host "8. Install / Uninstall audit watcher"
+    Write-Host "8. Audit settings: watcher, fail policy, head hash"
     Write-Host "9. Exit"
     Write-Host "==============================================="
     if ($script:AuditStatus) { Write-Host $script:AuditStatus.Text -ForegroundColor $script:AuditStatus.Color }
+    $pol = Get-AuditPolicyStatusLine
+    if ($pol) { Write-Host $pol.Text -ForegroundColor $pol.Color }
+}
+
+# Shown on every menu redraw: fail-open must never be a silent state.
+function Get-AuditPolicyStatusLine {
+    try {
+        $fp = Get-AuditFailPolicy
+        $pend = 0
+        try { $pend = @(Read-AuditPending).Count } catch { }
+        if ($fp.Tampered) { return @{ Text = 'AUDIT: settings.json does not match the log - fail-closed is enforced (see integrity records)'; Color = 'Red' } }
+        if ($fp.Policy -eq 'Open') {
+            $t = 'AUDIT FAIL-OPEN: changes are performed even if the audit log is unavailable'
+            if ($pend -gt 0) { $t += " ($pend unlogged change(s) waiting for reconciliation - run sync)" }
+            return @{ Text = $t; Color = 'Red' }
+        }
+        if ($pend -gt 0) { return @{ Text = "AUDIT: $pend unlogged change(s) waiting for reconciliation - run option 7"; Color = 'Yellow' } }
+    } catch { }
+    return $null
 }
 
 # Asks which network profile(s) the rule should be active on.
@@ -1567,7 +2065,10 @@ while ($true) {
     }
 
     if ($choice -eq '6') {
-        try { [void](Test-AuditLogIntegrity) } catch { Write-Host "Verification failed: $($_.Exception.Message)" -ForegroundColor Red }
+        $savedHead = (Read-Host "Saved head hash from an earlier check (<seq>:<hash>), Enter = skip").Trim()
+        try {
+            if ($savedHead) { [void](Test-AuditLogIntegrity -ExpectedHead $savedHead) } else { [void](Test-AuditLogIntegrity) }
+        } catch { Write-Host "Verification failed: $($_.Exception.Message)" -ForegroundColor Red }
         Read-Host "`nPress Enter to return to the menu..."
         continue
     }
@@ -1594,9 +2095,29 @@ while ($true) {
         } else {
             Write-Host "WARNING: the firewall event log is not readable; external changes will be recorded without the 'who'." -ForegroundColor Yellow
         }
-        $wChoice = (Read-Host "[I] Install / update   [U] Uninstall   [Enter] Cancel").Trim().ToUpperInvariant()
+        if ($w.Health) { Write-Host "Watcher health: $($w.Health.Health) $($w.Health.Message)" }
+        $fpNow = Get-AuditFailPolicy
+        Write-Host "Fail policy: $($fpNow.Policy) (Closed = no audit, no change; Open = change anyway, reconcile later)"
+        $wChoice = (Read-Host "[I] Install / update watcher   [U] Uninstall watcher   [F] Toggle fail policy   [H] Show head hash   [Enter] Cancel").Trim().ToUpperInvariant()
         try {
-            if ($wChoice -eq 'I') {
+            if ($wChoice -eq 'F') {
+                $newPol = if ($fpNow.Policy -eq 'Open') { 'Closed' } else { 'Open' }
+                if ($newPol -eq 'Open') {
+                    Write-Host "FAIL-OPEN lets firewall changes happen WITHOUT an audit record when the log is broken or locked." -ForegroundColor Yellow
+                    Write-Host "They are marked and reconciled by the next sync, but the 'who' may be lost." -ForegroundColor Yellow
+                }
+                $why = (Read-Host "Reason (recorded in the audit log)").Trim()
+                if ((Read-Host "Switch fail policy to $newPol? (y/N)").Trim().ToLowerInvariant() -eq 'y') {
+                    Set-AuditFailPolicy -Policy $newPol -Reason $why
+                    Write-Host "Fail policy is now $newPol." -ForegroundColor Yellow
+                }
+            } elseif ($wChoice -eq 'H') {
+                $head = Get-AuditHeadHash
+                if ($head) {
+                    Write-Host "Head: $($head.Text)   (record time $($head.Ts))" -ForegroundColor Cyan
+                    Write-Host "Store it OFF this machine. Option 6 can later check it to detect truncation or a full rewrite."
+                } else { Write-Host "The audit log is empty." }
+            } elseif ($wChoice -eq 'I') {
                 $wDetails = [ordered]@{ eventLog = $w.EventLog; taskPath = $script:AuditTaskPath + $script:AuditTaskName }
                 [void](Invoke-AuditedChange -Operation 'WatcherInstall' -Scope Names -Names @() -Reason 'Install audit watcher' -Details $wDetails -Action { Install-AuditWatcher })
                 Write-Host "Watcher installed." -ForegroundColor Green
