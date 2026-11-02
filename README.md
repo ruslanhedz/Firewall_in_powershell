@@ -59,11 +59,6 @@ Pod menu widać stan: watcher (zainstalowany / nieaktywny / ostatni przebieg nie
 - Ochrona: **head hash**. Menu 8 → **H** pokazuje `<seq>:<skrót>` najnowszego rekordu. Zapisz go **poza tym komputerem** (e-mail, zgłoszenie, wydruk). Opcja 6 porównana z zapisaną wartością wykryje obcięcie i pełne przepisanie. Bez zewnętrznej kopii tego nie da się wykryć.
 - Administrator może też wyłączyć watchera lub wyczyścić dziennik zdarzeń; skutki widać jako brak udanego przebiegu (stan watchera) i luki w atrybucji, a nie jako blokadę.
 
-## Dla współautorów
-
-- **Adam** (dodawanie reguł), **Aliaksei** (przełączanie profili), **Ruslan** (kopie zapasowe / przywracanie): każda zmiana polityki idzie przez `Invoke-AuditedChange`; nie edytujcie regionu AUDIT. Test kontraktu (`Test-FirewallAudit.ps1`) zakończy się błędem, jeśli poza regionem pojawi się bezpośrednie `New-NetFirewallRule`, `Set-…`, `Remove-…`, `netsh advfirewall` itp.
-- Gałęzie `ADAM-firewall_rules` i `Alex-Firewall` nie zmieniają polityki w sposób omijający audyt (stan na dzień przeglądu: tylko usunięcie komentarzy w `firewall.ps1`, scalenie z `main` bez konfliktów).
-
 ## Testy
 
 ```powershell
