@@ -9,10 +9,17 @@
     Non-interactive mode used by the audit watcher (Scheduled Task, SYSTEM).
     Reconciles the live firewall policy with the audit baseline and records every
     difference (changes made outside this script) in the audit log, then exits.
+
+.PARAMETER Agent
+    Non-interactive modes of the BACKUP module (owner: Ruslan). Used only by the backup
+    server over SSH (forced command in administrators_authorized_keys):
+    Export (print the policy). Restoring does not use the agent: the client downloads the
+    backup over SFTP and imports it locally (see backup\Backup-Restore.ps1).
 #>
 [CmdletBinding()]
 param(
-    [switch]$SyncAudit
+    [switch]$SyncAudit,
+    [ValidateSet('Export')][string]$Agent
 )
 
 #region AUDIT
@@ -1937,6 +1944,50 @@ if ($SyncAudit) {
     }
 }
 
+# =============================================================================
+# BACKUP MODULE  (owner: Ruslan)  -  backup / restore with the central backup server
+# =============================================================================
+# * The backup server PULLS the policy from this computer over SSH (key restricted by
+#   authorized_keys to:  powershell ... -File <this script> -Agent Export).
+# * Restores: the server only checks the chosen backup; this computer DOWNLOADS it over SFTP
+#   (list + download permissions), verifies SHA-256 and imports it through Invoke-AuditedChange
+#   (Operation Restore, Scope All), as the audit contract requires.
+# * The code lives in two files in the 'backup' directory (see the BACKUP region below).
+# Variables and functions of this module use the prefix Bk / Bk- to avoid clashes with AUDIT.
+# =============================================================================
+#region BACKUP
+# The BACKUP module is split in two files in the 'backup' directory next to this script:
+#   backup\Backup-Create.ps1    shared settings/helpers, Export agent, creating backups, listing
+#   backup\Backup-Restore.ps1   restoring a backup (download + verify + audited import)
+# The files run with administrator rights, so the directory must not be writable by normal users;
+# the check below reuses the AUDIT module's ACL test and refuses to load otherwise.
+$script:BkModuleDir = Join-Path $PSScriptRoot 'backup'
+$bkSec = $null
+try {
+    $bkSec = Test-AuditDirSecurity -Acl ((New-Object IO.DirectoryInfo($script:BkModuleDir)).GetAccessControl())
+} catch {
+    throw "Backup module directory not found or unreadable: $($script:BkModuleDir)"
+}
+if (-not $bkSec.Ok) {
+    throw ("Backup module directory $($script:BkModuleDir) is not protected (owner $($bkSec.Owner); $($bkSec.Issues -join '; ')). " +
+        'Fix: icacls.exe <dir> /setowner *S-1-5-32-544 ; icacls.exe <dir> /inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F')
+}
+foreach ($bkFile in 'Backup-Create.ps1', 'Backup-Restore.ps1') {
+    $bkPath = Join-Path $script:BkModuleDir $bkFile
+    if (-not (Test-Path -LiteralPath $bkPath)) { throw "Backup module file missing: $bkPath" }
+    . $bkPath
+}
+
+# ---- non-interactive entry point used by the backup server (SSH forced command)
+if ($Agent) {
+    Invoke-BackupAgent -Agent $Agent
+    exit 0
+}
+
+# ---- interactive client settings (menu option 9)
+Initialize-BkClient
+#endregion BACKUP
+
 function Show-Menu {
     Clear-Host
     Write-Host "=== FIREWALL RULES MANAGEMENT ===" -ForegroundColor Cyan
@@ -1948,7 +1999,8 @@ function Show-Menu {
     Write-Host "6. Verify audit log integrity"
     Write-Host "7. Sync audit now (detect changes made outside this tool)"
     Write-Host "8. Audit settings: watcher, fail policy, head hash"
-    Write-Host "9. Exit"
+    Write-Host "9. Backups: backup now / restore / list (backup server)"
+    Write-Host "10. Exit"
     Write-Host "==============================================="
     if ($script:AuditStatus) { Write-Host $script:AuditStatus.Text -ForegroundColor $script:AuditStatus.Color }
     $pol = Get-AuditPolicyStatusLine
@@ -2046,13 +2098,13 @@ $script:AuditStatus = Get-AuditWatcherSummaryLine
 
 while ($true) {
     Show-Menu
-    $choice = Read-Host "Select an option (1-9)"
+    $choice = Read-Host "Select an option (1-10)"
 
-    if ($choice -eq '9') {
+    if ($choice -eq '10') {
         Write-Host "Exiting script..." -ForegroundColor Yellow
         break
     }
-    if ($choice -notin @('1', '2', '3', '4', '5', '6', '7', '8')) {
+    if ($choice -notin @('1', '2', '3', '4', '5', '6', '7', '8', '9')) {
         Write-Host "Invalid choice. Press Enter to try again." -ForegroundColor Red
         Read-Host
         continue
@@ -2134,6 +2186,26 @@ while ($true) {
         continue
     }
 
+    if ($choice -eq '9') {
+        Write-Host "`n--- Backup server $($script:BkCfg.Host) ---" -ForegroundColor Cyan
+        $bChoice = (Read-Host "[B] Backup now   [R] Restore from a backup   [L] List backups   [Enter] Cancel").Trim().ToUpperInvariant()
+        try {
+            if ($bChoice -eq 'B') {
+                [void](Request-ServerBackup -Reason 'manual')
+            } elseif ($bChoice -eq 'R') {
+                Invoke-ServerRestore
+            } elseif ($bChoice -eq 'L') {
+                $bl = @(Get-ServerBackups)
+                if ($bl.Count -eq 0) { Write-Host "No backups found on the server." -ForegroundColor Yellow }
+                else { $bl | Format-Table Index, Date, Reason, File -AutoSize }
+            }
+        } catch {
+            Write-Host "Backup operation failed: $($_.Exception.Message)" -ForegroundColor Red
+        }
+        Read-Host "`nPress Enter to return to the menu..."
+        continue
+    }
+
     if ($choice -eq '3' -or $choice -eq '4') {
         # Show which profile(s) this machine is connected to right now
         Write-Host "`n--- Active Network Profile(s) ---" -ForegroundColor Cyan
@@ -2180,6 +2252,11 @@ while ($true) {
                 $idx = 0
                 if ([int]::TryParse($delIndex, [ref]$idx) -and $idx -ge 1 -and $idx -le $ruleDetails.Count) {
                     $ruleToDelete = $ruleDetails[$idx - 1]
+                    if (-not (Invoke-PreChangeBackup -Reason 'auto-delete')) {
+                        Write-Host "No backup - deletion aborted." -ForegroundColor Red
+                        Read-Host "`nPress Enter to return to the menu..."
+                        continue
+                    }
                     Write-Host "Deleting rule: $($ruleToDelete.DisplayName)..." -ForegroundColor Yellow
                     try {
                         # Audited: intent -> snapshot before/after -> change + result records.
@@ -2286,6 +2363,12 @@ while ($true) {
         } else {
             $parameters.Add('RemotePort', $port)
         }
+    }
+
+    if (-not (Invoke-PreChangeBackup -Reason 'auto-add')) {
+        Write-Host "No backup - adding the rule aborted." -ForegroundColor Red
+        Read-Host "`nPress Enter to return to the menu..."
+        continue
     }
 
     Write-Host "`nCreating rule..." -ForegroundColor Yellow
