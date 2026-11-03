@@ -77,77 +77,273 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tests\Invoke-WatcherAccept
 Skrypt instaluje watchera, tworzy i usuwa własne reguły `FWAUDIT-ACCEPT-*` poza narzędziem, czeka na wpisy watchera, sprawdza `state.json`, scenariusz fail-open przy zablokowanym dzienniku oraz łańcuch skrótów; kończy się kodem 0 tylko przy wszystkich zaliczonych krokach. Zapisuje do prawdziwego dziennika audytu.
 
 
-## Backup
+# Backup
 
-Skrypt potrafi zapisać **kopię wszystkich reguł zapory** na serwerze i w każdej chwili je **przywrócić**.
+Skrypt zapisuje kopię **wszystkich reguł Zapory Windows** na osobnym serwerze i w każdej chwili potrafi ją przywrócić. Każde przywrócenie trafia do dziennika audytu.
 
-- Kopia powstaje **sama** przed każdym dodaniem lub usunięciem reguły, a także na żądanie.
-- Przywracanie ma **zabezpieczenie**: po przywróceniu masz 90 sekund na potwierdzenie. Jeśli nie potwierdzisz, zapora **sama wraca** do poprzedniego stanu.
-- Każde przywrócenie zapisuje się w dzienniku audytu.
+- Kopia powstaje **automatycznie przed każdym dodaniem i usunięciem reguły**, a także na żądanie.
+- Przed przywróceniem można zapisać kopię bieżącej konfiguracji (`pre-restore`), więc zawsze jest droga powrotu.
+- Przywracany plik jest sprawdzany skrótem SHA-256 po stronie serwera i jeszcze raz na Windowsie, przed importem.
 
-### Jak z tego korzystać
+> **Uwaga:** przywrócenie **zastępuje całą politykę zapory**, nie pojedyncze reguły. Nie ma automatycznego cofania, dlatego zalecana odpowiedź na pytanie o kopię `pre-restore` to `yes`.
 
-W menu wybierz **9**, a potem jedną z liter:
+---
+
+## 1. Jak z tego korzystać
+
+Uruchom `FirewallRules.ps1` jako administrator, w menu wybierz **9**, a potem literę:
 
 | Litera | Co robi |
-|--------|---------|
+|:------:|---------|
 | **B** | zrób kopię teraz |
-| **L** | pokaż listę kopii |
-| **R** | przywróć wybraną kopię |
+| **L** | pokaż listę kopii z serwera |
+| **R** | przywróć wybraną kopię (trzeba wpisać słowo `RESTORE`) |
 
-### Co jest potrzebne
+Przykład nazwy kopii: `DESKTOP-M67HB24_20261103_163456_auto-add.wfw`, czyli `<komputer>_<data>_<godzina>_<powód>`. Powody: `manual`, `auto-add`, `auto-delete`, `pre-restore`, `scheduled`.
 
-- **Komputer z Windows** (`10.0.2.20`) – tu działa skrypt i tu są reguły.
-- **Serwer z Ubuntu** (`10.0.2.30`) – tu leżą kopie, w katalogu `/srv/fwbackups/`.
-- Na obu komputerach zainstalowany **SSH** (na Windowsie: OpenSSH Client i Server).
-- Na serwerze działający **SFTPGo** (port `2022`) z kontem `student`, które może tylko **oglądać** kopie (uprawnienia `list`).
+---
 
-### Przygotowanie (jednorazowo)
+## 2. Jak to działa
 
-**1. Serwer Ubuntu** – użytkownik, katalogi i klucze:
+```
+ Windows 10.0.2.20                                Ubuntu 10.0.2.30
+ ┌──────────────────────────┐                    ┌──────────────────────────────┐
+ │ FirewallRules.ps1 (menu) │ ─── 1. polecenie ─▶│ fw-server.sh                 │
+ │ backup\Backup-*.ps1      │      (SSH :22)     │  backup.sh / restore.sh      │
+ │                          │                    │                              │
+ │ sshd  ◀──────────────────│─── 2. eksport ─────│ serwer POBIERA politykę      │
+ │ (agent „Export”)         │      (SSH :22)     │                              │
+ │                          │                    │ /srv/fwbackups/<konto>/      │
+ │ sftp  ◀──────────────────│─── 3. pobranie ────│  backups/*.wfw + *.sha256    │
+ └──────────────────────────┘      (SFTPGo :2022)└──────────────────────────────┘
+```
+
+1. **Backup (B albo automatycznie):** klient prosi serwer o kopię. Serwer łączy się z Windowsem, pobiera politykę (`netsh advfirewall export`), sprawdza SHA-256 i zapisuje plik `.wfw` oraz `.wfw.sha256`.
+2. **Lista (L):** klient pyta SFTPGo o nazwy plików. Widzi tylko kopie, które mają plik `.sha256`.
+3. **Przywracanie (R):**
+   - serwer sprawdza wybraną kopię i (jeśli chcesz) zapisuje kopię bieżącej konfiguracji,
+   - Windows **pobiera** kopię przez SFTP, liczy SHA-256 i porównuje ze skrótem z serwera,
+   - dopiero wtedy importuje ją przez moduł audytu (operacja `Restore`), więc zmiana trafia do dziennika.
+
+Serwer **nie wysyła** już niczego do Windowsa przy przywracaniu. To usunęło losowe błędy `timeout waiting for request data` i sprawiło, że serwer nie potrzebuje klucza, który pozwala wgrać dowolną politykę na komputer.
+
+---
+
+## 3. Co jest potrzebne
+
+- **Windows** (10.0.2.20): tu działa skrypt i tu są reguły. Zainstalowany OpenSSH Client i **OpenSSH Server**, konto administratora.
+- **Ubuntu** (10.0.2.30): tu leżą kopie w `/srv/fwbackups/`. Działa SFTPGo na porcie 2022.
+- **Konto `student` w SFTPGo** z uprawnieniami **`list` i `download`** do `/backups`. Bez `upload`, `overwrite`, `delete`, `rename`, czyli kopii nie da się zmienić ani skasować, tylko odczytać.
+
+---
+
+## 4. Instalacja (jednorazowo)
+
+Adresy i nazwy (10.0.2.20, 10.0.2.30, `student`, `Student`) zmień na własne.
+
+### 4.1 Serwer Ubuntu
+
+Użytkownik, katalogi i klucz do pobierania kopii z Windowsa:
 
 ```bash
 sudo useradd --system --create-home --shell /bin/bash fwbackup
 sudo install -d -o fwbackup -g fwbackup -m 750 /etc/fwbackup /srv/fwbackups /var/lib/fwbackup/locks /var/log/fwbackup
-sudo -u fwbackup ssh-keygen -t ed25519 -N '' -f /etc/fwbackup/id_export
-sudo -u fwbackup ssh-keygen -t ed25519 -N '' -f /etc/fwbackup/id_import
+sudo -u fwbackup ssh-keygen -t ed25519 -N '' -C fwbackup-export -f /etc/fwbackup/id_export
 sudo -u fwbackup sh -c 'ssh-keyscan -t ed25519 10.0.2.20 > /etc/fwbackup/known_hosts'
 ```
 
-Potem w pliku `/etc/fwbackup/clients.conf` wpisz jedną linię (konto, adres Windowsa, nazwa użytkownika Windows): student 10.0.2.20 Student
+Skrypty serwera (biblioteki muszą należeć do roota, żeby `fwbackup` nie mógł zmienić kodu, który wykonuje):
 
-**2. Windows** – katalog ze skryptem i zezwolenie dla serwera:
+```bash
+sudo install -d -m 755 /usr/local/lib/fwbackup
+sudo install -m 644 -o root -g root backup.sh restore.sh /usr/local/lib/fwbackup/
+sudo install -m 755 fw-server.sh /usr/local/bin/fw-server.sh
+```
+
+Plik `/etc/fwbackup/clients.conf`, jedna linia: konto, adres Windowsa, nazwa użytkownika Windows:
+
+```
+student 10.0.2.20 Student
+```
+
+Opcjonalnie kopia co godzinę, w `/etc/cron.d/fwbackup`:
+
+```
+0 * * * * fwbackup /usr/local/bin/fw-server.sh scheduled
+```
+
+### 4.2 SFTPGo i uprawnienia plików
+
+SFTPGo działa jako użytkownik `sftpgo` i musi móc **czytać** kopie. Katalog z kopiami powinien mieć grupę `sftpgo` i bit setgid, żeby nowe pliki dziedziczyły grupę (nowy `fw-server.sh` zapisuje pliki właśnie tak):
+
+```bash
+sudo chgrp sftpgo /srv/fwbackups/student /srv/fwbackups/student/backups
+sudo chmod 750 /srv/fwbackups/student
+sudo chmod 2750 /srv/fwbackups/student/backups
+sudo chgrp sftpgo /srv/fwbackups/student/backups/*     # tylko jeśli już są kopie
+sudo chmod 640 /srv/fwbackups/student/backups/*
+```
+
+W panelu SFTPGo (użytkownik `student`):
+- katalog wirtualny `/backups` wskazuje na `/srv/fwbackups/student/backups`,
+- uprawnienia dla `/backups`: **`list` i `download`**,
+- logowanie kluczem publicznym klienta (z kroku 4.3), port `2022`.
+
+### 4.3 Windows – skrypty
+
+Układ plików:
+
+```
+C:\FW\FirewallRules.ps1
+C:\FW\backup\Backup-Create.ps1     tworzenie kopii, agent eksportu, lista
+C:\FW\backup\Backup-Restore.ps1    przywracanie
+```
 
 ```powershell
-New-Item -ItemType Directory -Path C:\FW -Force | Out-Null
-# skopiuj firewall.ps1 do C:\FW\firewall.ps1
+New-Item -ItemType Directory -Path C:\FW\backup -Force | Out-Null
+# skopiuj FirewallRules.ps1 do C:\FW oraz Backup-Create.ps1 i Backup-Restore.ps1 do C:\FW\backup
+icacls.exe C:\FW /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F"
+Get-ChildItem C:\FW -Recurse -Filter *.ps1 | Unblock-File
+```
+
+Pliki w `backup\` działają z uprawnieniami administratora, dlatego skrypt odmówi ich wczytania, jeśli zwykły użytkownik ma prawo zapisu do tego katalogu.
+
+### 4.4 Windows – SSH i zapora
+
+```powershell
 Set-Service sshd -StartupType Automatic; Start-Service sshd
 New-NetFirewallRule -Name 'FWBackup-SSH-In' -DisplayName 'FWBackup SSH from backup server' `
     -Direction Inbound -Action Allow -Protocol TCP -LocalPort 22 -RemoteAddress 10.0.2.30 -Profile Any
 ```
 
-**3. Windows** – klucz dla własnych połączeń z serwerem:
+W pliku `C:\ProgramData\ssh\sshd_config` na samym początku dopisz (nazwa konta **małymi literami**):
+
+```
+AllowUsers student@10.0.2.30
+```
+
+Na końcu pliku:
+
+```
+Match Address 10.0.2.30
+    PasswordAuthentication no
+```
+
+```powershell
+Copy-Item "$env:ProgramData\ssh\sshd_config" "$env:ProgramData\ssh\sshd_config.bak" -Force
+& "$env:WINDIR\System32\OpenSSH\sshd.exe" -t      # brak wyniku = składnia poprawna
+Restart-Service sshd
+```
+
+Zastrzeżenie: dopisz też adres, z którego sam administrujesz komputerem przez SSH, jeśli taki masz.
+
+### 4.5 Windows – klucz do rozmowy z serwerem
 
 ```powershell
 New-Item -ItemType Directory -Path "$env:USERPROFILE\.fwbackup" -Force | Out-Null
 ssh-keygen -t ed25519 -N '""' -f "$env:USERPROFILE\.fwbackup\id_ed25519"
 ssh-keyscan -t ed25519 -p 22   10.0.2.30 | Out-File -Encoding ascii -Append "$env:USERPROFILE\.fwbackup\known_hosts"
 ssh-keyscan -t ed25519 -p 2022 10.0.2.30 | Out-File -Encoding ascii -Append "$env:USERPROFILE\.fwbackup\known_hosts"
+Get-Content "$env:USERPROFILE\.fwbackup\id_ed25519.pub"
 ```
 
-Powstały plik `id_ed25519.pub` trzeba dodać na serwerze (użytkownik `fwbackup`, plik `~/.ssh/authorized_keys`) w tej jednej linii:
-from="10.0.2.20",restrict,command="/usr/local/bin/fw-server.sh request student" ssh-ed25519 AAAA...
+Wypisany klucz publiczny dodaj w **dwóch** miejscach:
 
-Ten sam klucz dodaj do konta `student` w SFTPGo.
+1. Na serwerze, w pliku `~fwbackup/.ssh/authorized_keys` (katalog `700`, plik `600`, właściciel `fwbackup`), w jednej linii:
+   ```
+   from="10.0.2.20",restrict,command="/usr/local/bin/fw-server.sh request student" ssh-ed25519 AAAA... student@KOMPUTER
+   ```
+2. W koncie `student` w SFTPGo.
 
-**4. Windows** – pozwól serwerowi uruchamiać skrypt. W pliku `C:\ProgramData\ssh\administrators_authorized_keys` mają być dwie linie, po jednej na klucz serwera (`id_export.pub` i `id_import.pub`):
+### 4.6 Windows – pozwól serwerowi pobierać kopię
+
+Serwer loguje się na Windows kluczem `id_export` i może uruchomić tylko eksport. W `C:\ProgramData\ssh\administrators_authorized_keys` ma być **jedna** linia na ten klucz (inne wpisy zostają):
 
 ```powershell
-$exportPub = 'ssh-ed25519 AAAA...'   # cała linia z id_export.pub
-$importPub = 'ssh-ed25519 AAAA...'   # cała linia z id_import.pub
-$opts = 'no-port-forwarding,no-agent-forwarding,no-X11-forwarding,no-pty'
-$cmd  = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:/FW/firewall.ps1 -Agent '
+$exportPub = 'ssh-ed25519 AAAA...'     # cała linia z /etc/fwbackup/id_export.pub
+if ($exportPub -notmatch '^ssh-ed25519 AAAA\S{40,}') { throw 'Klucz wygląda na niepełny.' }
+
 $ak   = "$env:ProgramData\ssh\administrators_authorized_keys"
-Set-Content -Path $ak -Encoding ascii -Value @("command=`"$($cmd)Export`",$opts $exportPub", "command=`"$($cmd)Import`",$opts $importPub")
+$opts = 'no-port-forwarding,no-agent-forwarding,no-X11-forwarding,no-pty'
+$cmd  = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:/FW/FirewallRules.ps1 -Agent Export'
+if (Test-Path $ak) { Copy-Item $ak "$ak.bak" -Force }
+$keep = @(); if (Test-Path $ak) { $keep = @(Get-Content $ak | Where-Object { $_ -notmatch 'FirewallRules\.ps1|firewall\.ps1' }) }
+Set-Content -Path $ak -Encoding ascii -Value ($keep + @("command=`"$cmd`",$opts $exportPub"))
 icacls.exe $ak /inheritance:r /grant "*S-1-5-18:F" /grant "*S-1-5-32-544:F"
 ```
+
+Ten plik obowiązuje, bo konto `Student` jest administratorem. Ścieżka w `command=` musi dokładnie wskazywać skrypt.
+
+### 4.7 Windows – obserwator audytu
+
+Uruchom `FirewallRules.ps1`, wybierz **8**, potem **I**. Po każdej zmianie `FirewallRules.ps1` zainstaluj obserwatora ponownie.
+
+---
+
+## 5. Test odbiorczy
+
+| # | Co zrobić | Oczekiwany wynik |
+|:-:|-----------|------------------|
+| 1 | Ubuntu: `sudo -u fwbackup ssh -T -o LogLevel=ERROR -i /etc/fwbackup/id_export -o UserKnownHostsFile=/etc/fwbackup/known_hosts Student@10.0.2.20 agent \| head -6` | `FWAGENT-BEGIN`, `COMPUTER=`, `SHA256=`, `SIZE=`, `DATA` |
+| 2 | Menu **9 → B** | `Backup OK`, na serwerze pojawiają się `.wfw` i `.sha256` |
+| 3 | Menu **9 → L** | lista kopii z datą i powodem |
+| 4 | Windows: `sftp -P 2022 -i $env:USERPROFILE\.fwbackup\id_ed25519 student@10.0.2.30`, potem `get backups/<plik>` | plik się pobiera |
+| 5 | W tej samej sesji `put x.txt backups/x.txt` i `rm backups/<plik>` | **odmowa** (brak `upload` i `delete`) |
+| 6 | Dodaj regułę (1) i usuń ją (4) | przed każdą zmianą powstaje kopia `auto-add` i `auto-delete` |
+| 7 | **9 → R**, kopia z regułą | `Restore completed`, reguła wraca (opcja 3) |
+| 8 | Powtórz restore 10 razy | 10 na 10 bez błędu |
+| 9 | Menu **5** i **6** | w dzienniku rekord `Restore`, łańcuch skrótów poprawny |
+
+---
+
+## 6. Gdy coś nie działa
+
+Dzienniki: `/var/log/fwbackup/server.log` (serwer), `C:\ProgramData\FirewallBackup\agent\agent.log` (Windows), `OpenSSH/Operational` w Podglądzie zdarzeń.
+
+| Objaw | Co sprawdzić |
+|-------|--------------|
+| `Permission denied (publickey)` w `server.log` | klucza `id_export` nie ma w `administrators_authorized_keys`, zła ścieżka w `command=`, złe prawa pliku albo `AllowUsers` pisane wielkimi literami |
+| `client not registered on the server` | brak wpisu w `clients.conf` albo nazwa konta ma wielkie litery |
+| `download failed ... permission` | w SFTPGo brakuje `download` albo użytkownik `sftpgo` nie ma prawa odczytu pliku (punkt 4.2) |
+| `SHA-256 mismatch` | pobranie uszkodzone albo kopia zmieniona; spróbuj jeszcze raz i sprawdź plik na serwerze |
+| `backup not found on server` | kopię przycięto (zostaje 30 najnowszych `auto-*` i `scheduled`); odśwież listę |
+| `Backup module directory ... is not protected` | popraw ACL katalogu `C:\FW\backup` (polecenie jest w komunikacie) |
+| `netsh import failed` | `netsh` odrzucił plik; komunikat jest też w `agent.log` |
+| Po przywróceniu nie ma połączenia z serwerem | zaimportowana polityka blokuje SSH lub SFTP; użyj konsoli maszyny i przywróć kopię `pre-restore` |
+| Zawieszona operacja na serwerze | `sudo pkill -u fwbackup -f 'ssh -T'; sudo pkill -u fwbackup -f fw-server.sh` |
+
+---
+
+## 7. Bezpieczeństwo i ograniczenia
+
+- **Klucze mają jedno zadanie.** Klucz klienta pozwala tylko wywołać `fw-server.sh request` i listować/pobierać kopie. Klucz `id_export` na Windowsie pozwala tylko na eksport. Żaden klucz nie daje powłoki (`restrict`, `command=`).
+- **Adresy są ograniczone** w trzech miejscach: `from=` w kluczu klienta, `Match Address` i `AllowUsers` w `sshd_config`, regułą `FWBackup-SSH-In` dla serwera.
+- **Klucze hostów są przypięte** (`StrictHostKeyChecking=yes`).
+- **Klient `student` może czytać swoje kopie**, ale nie może ich zmienić ani usunąć. Kopie zawierają reguły zapory, więc traktuj je jak dane wrażliwe.
+- **Kopie nie są szyfrowane** i leżą w jednym miejscu. Skrót SHA-256 chroni przed uszkodzeniem, nie przed złośliwą zmianą na serwerze.
+- **Brak automatycznego cofania.** Dlatego zapisuj kopię `pre-restore`, a przy pracy zdalnej miej dostęp do konsoli maszyny.
+- Jeśli przywrócona polityka blokuje ruch do serwera (porty 22 lub 2022), kolejne kopie i restore nie zadziałają, dopóki jej nie naprawisz.
+
+---
+
+## 8. Ustawienia
+
+| Co | Gdzie | Domyślnie |
+|----|-------|-----------|
+| Adres serwera | `Backup-Create.ps1`, `$script:BkServerIp` | `10.0.2.30` |
+| Porty SFTP/SSH, konto serwisowe, konto SFTP (`UserOverride`) | `Backup-Create.ps1`, `Initialize-BkClient` | `2022`, `22`, `fwbackup`, nazwa użytkownika Windows małymi literami |
+| Czekanie na backup / restore | `Backup-Create.ps1`, `Initialize-BkClient` | 120 s / 180 s |
+| Ile kopii `auto-*` i `scheduled` zostaje | `fw-server.sh`, `KEEP_AUTO` | 30 |
+| Liczba prób pobrania kopii z Windowsa | `fw-server.sh`, `EXPORT_TRIES` | 3 |
+
+---
+
+## 9. Pliki projektu
+
+| Plik | Gdzie leży | Rola |
+|------|------------|------|
+| `FirewallRules.ps1` | Windows: `C:\FW\` | menu, audyt, ładowanie modułu backupu |
+| `Backup-Create.ps1` | Windows: `C:\FW\backup\` | tworzenie kopii, agent eksportu, lista |
+| `Backup-Restore.ps1` | Windows: `C:\FW\backup\` | przywracanie |
+| `fw-server.sh` | Ubuntu: `/usr/local/bin/` | dyspozytor i funkcje wspólne |
+| `backup.sh`, `restore.sh` | Ubuntu: `/usr/local/lib/fwbackup/` | tworzenie kopii i przygotowanie restore |
