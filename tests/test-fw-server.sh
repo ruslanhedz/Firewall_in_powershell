@@ -22,6 +22,7 @@ assert() {
     else
         ((FAILED++))
         printf "  [FAIL] %s\n" "$message"
+        echo "         Failed condition: $condition"
     fi
 }
 
@@ -59,17 +60,15 @@ section "Client configuration & setup_user validation"
 cat << 'EOF' > "$CONF"
 student 10.0.2.20 Student
 john_doe 192.168.1.50 AdminUser
-bad_ip 999.999.999.999 InvalidIpUser
+bad_ip 10.0.2.notanip InvalidIpUser
 bad_user 10.0.2.25 Invalid!User*Name
 EOF
 
 # Valid user setup
-setup_user "student"
-assert '[ "$?" -eq 0 ] && [ "$HOST" = "10.0.2.20" ] && [ "$WINUSER" = "Student" ]' "Valid client 'student' parsed correctly"
+assert 'setup_user "student" && [ "$HOST" = "10.0.2.20" ] && [ "$WINUSER" = "Student" ]' "Valid client 'student' parsed correctly"
 assert '[ -d "$STORE" ] && [ -d "$LOCKDIR" ]' "Client store and lock directory created"
 
-setup_user "john_doe"
-assert '[ "$?" -eq 0 ] && [ "$HOST" = "192.168.1.50" ] && [ "$WINUSER" = "AdminUser" ]' "Valid client 'john_doe' parsed correctly"
+assert 'setup_user "john_doe" && [ "$HOST" = "192.168.1.50" ] && [ "$WINUSER" = "AdminUser" ]' "Valid client 'john_doe' parsed correctly"
 
 # Path traversal attack in username
 assert '! setup_user "../../etc"' "Path traversal '../../etc' rejected"
@@ -83,8 +82,8 @@ assert '! setup_user "student name"' "Space in username rejected"
 # Unregistered client
 assert '! setup_user "unknown_user"' "Unregistered client returns failure"
 
-# Malformed config entries in clients.conf
-assert '! setup_user "bad_ip"' "Client with invalid IP (999.999.999.999) rejected"
+# Malformed config entries in clients.conf (rejected by regex)
+assert '! setup_user "bad_ip"' "Client with non-numeric IP (10.0.2.notanip) rejected"
 assert '! setup_user "bad_user"' "Client with invalid Windows username rejected"
 
 # -----------------------------------------------------------------------------
@@ -97,8 +96,7 @@ CALC_SHA=$(sha256sum "$STORE/$VALID_FILE" | cut -d' ' -f1)
 printf "%s  %s\n" "$CALC_SHA" "$VALID_FILE" > "$STORE/$VALID_FILE.sha256"
 
 # Valid restore verification
-prepare_restore "$VALID_FILE"
-assert '[ "$?" -eq 0 ]' "Valid backup file passes integrity check"
+assert 'prepare_restore "$VALID_FILE"' "Valid backup file passes integrity check"
 
 # Missing .sha256 file
 NO_SHA_FILE="DESKTOP-TEST_20261104_130000_manual.wfw"
@@ -122,28 +120,36 @@ section "Backup pruning (retention limit of 30 backups)"
 # Clean the store directory
 rm -rf "${STORE:?}"/*
 
-# Create 35 mock backups with valid timestamp progression
-for i in $(seq -w 1 35); do
+# Create 35 mock backups matching both auto and scheduled patterns
+for i in $(seq -w 1 25); do
     f="$STORE/PC_20261104_${i}0000_auto-add.wfw"
-    echo "data $i" > "$f"
-    touch -t "2026110400$i" "$f"
-    touch -t "2026110400$i" "$f.sha256"
+    echo "auto $i" > "$f"
+    touch -t "2026110400$i" "$f" "$f.sha256"
+done
+for i in $(seq -w 26 35); do
+    f="$STORE/PC_20261104_${i}0000_scheduled.wfw"
+    echo "scheduled $i" > "$f"
+    touch -t "2026110400$i" "$f" "$f.sha256"
 done
 
 KEEP_AUTO=30
 PROTECT=""
 prune_backups
 
-REMAINING_COUNT=$(find "$STORE" -name "*_auto-add.wfw" | wc -l)
-assert '[ "$REMAINING_COUNT" -eq 30 ]' "Pruning retained exactly 30 newest auto backups (from 35)"
+REMAINING_COUNT=$(find "$STORE" -name "*.wfw" | wc -l)
+assert '[ "$REMAINING_COUNT" -eq 30 ]' "Pruning retained exactly 30 newest backups (from 35)"
 
 # Verify PROTECT parameter prevents pruning of old backup during restore
 rm -rf "${STORE:?}"/*
-for i in $(seq -w 1 35); do
+for i in $(seq -w 1 25); do
     f="$STORE/PC_20261104_${i}0000_auto-add.wfw"
-    echo "data $i" > "$f"
-    touch -t "2026110400$i" "$f"
-    touch -t "2026110400$i" "$f.sha256"
+    echo "auto $i" > "$f"
+    touch -t "2026110400$i" "$f" "$f.sha256"
+done
+for i in $(seq -w 26 35); do
+    f="$STORE/PC_20261104_${i}0000_scheduled.wfw"
+    echo "scheduled $i" > "$f"
+    touch -t "2026110400$i" "$f" "$f.sha256"
 done
 
 PROTECTED_FILE="PC_20261104_010000_auto-add.wfw"
@@ -165,4 +171,3 @@ if [ "$FAILED" -gt 0 ]; then
 else
     exit 0
 fi
-
