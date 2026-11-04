@@ -25,7 +25,8 @@ Numeracja jest stała (1–9). Nowe funkcje audytu trafiają do podmenu opcji 8,
 | 6 | Weryfikacja integralności dziennika (łańcuch skrótów, rotacja); opcjonalnie porównanie z zapisanym *head hash* |
 | 7 | Synchronizacja audytu teraz (wykrycie zmian wykonanych poza narzędziem) |
 | 8 | Ustawienia audytu: **[I]** instalacja / aktualizacja watchera, **[U]** usunięcie watchera, **[F]** przełącznik *fail-closed / fail-open*, **[H]** pokaż *head hash* |
-| 9 | Wyjście |
+| 9 | Backup: backup now / restore / list (backup server) |
+| 10 | Exit |
 
 Pod menu widać stan: watcher (zainstalowany / nieaktywny / ostatni przebieg nieudany / brak udanego przebiegu od > 45 min) oraz wyraźny czerwony wiersz `AUDIT FAIL-OPEN`, gdy włączony jest tryb fail-open, albo informację o zmianach czekających na uzgodnienie.
 
@@ -79,19 +80,19 @@ Skrypt instaluje watchera, tworzy i usuwa własne reguły `FWAUDIT-ACCEPT-*` poz
 
 # Backup
 
-Skrypt zapisuje kopię **wszystkich reguł Zapory Windows** na osobnym serwerze i w każdej chwili potrafi ją przywrócić. Każde przywrócenie trafia do dziennika audytu.
+Skrypt `firewall.ps1` zapisuje kopię **wszystkich reguł Zapory Windows** na osobnym serwerze i w każdej chwili potrafi ją przywrócić. Każde przywrócenie trafia do dziennika audytu.
 
 - Kopia powstaje **automatycznie przed każdym dodaniem i usunięciem reguły**, a także na żądanie.
 - Przed przywróceniem można zapisać kopię bieżącej konfiguracji (`pre-restore`), więc zawsze jest droga powrotu.
 - Przywracany plik jest sprawdzany skrótem SHA-256 po stronie serwera i jeszcze raz na Windowsie, przed importem.
 
-> **Uwaga:** przywrócenie **zastępuje całą politykę zapory**, nie pojedyncze reguły. Nie ma automatycznego cofania, dlatego zalecana odpowiedź na pytanie o kopię `pre-restore` to `yes`.
+> **Uwaga:** przywrócenie **zastępuje całą politykę zapory**, nie pojedyncze reguły. Nie ma automatycznego cofania, dlatego na pytanie o kopię `pre-restore` odpowiadaj `yes`.
 
 ---
 
 ## 1. Jak z tego korzystać
 
-Uruchom `FirewallRules.ps1` jako administrator, w menu wybierz **9**, a potem literę:
+Uruchom `firewall.ps1` jako administrator, w menu wybierz **9**, a potem literę:
 
 | Litera | Co robi |
 |:------:|---------|
@@ -108,8 +109,8 @@ Przykład nazwy kopii: `DESKTOP-M67HB24_20261103_163456_auto-add.wfw`, czyli `<k
 ```
  Windows 10.0.2.20                                Ubuntu 10.0.2.30
  ┌──────────────────────────┐                    ┌──────────────────────────────┐
- │ FirewallRules.ps1 (menu) │ ─── 1. polecenie ─▶│ fw-server.sh                 │
- │ backup\Backup-*.ps1      │      (SSH :22)     │  backup.sh / restore.sh      │
+ │ firewall.ps1 (menu)      │ ─── 1. polecenie ─▶│ fw-server.sh                 │
+ │ backup\Backup-*.ps1      │      (SSH :22)     │                              │
  │                          │                    │                              │
  │ sshd  ◀──────────────────│─── 2. eksport ─────│ serwer POBIERA politykę      │
  │ (agent „Export”)         │      (SSH :22)     │                              │
@@ -125,7 +126,7 @@ Przykład nazwy kopii: `DESKTOP-M67HB24_20261103_163456_auto-add.wfw`, czyli `<k
    - Windows **pobiera** kopię przez SFTP, liczy SHA-256 i porównuje ze skrótem z serwera,
    - dopiero wtedy importuje ją przez moduł audytu (operacja `Restore`), więc zmiana trafia do dziennika.
 
-Serwer **nie wysyła** już niczego do Windowsa przy przywracaniu. To usunęło losowe błędy `timeout waiting for request data` i sprawiło, że serwer nie potrzebuje klucza, który pozwala wgrać dowolną politykę na komputer.
+Serwer **nie wysyła** niczego do Windowsa przy przywracaniu. To usunęło losowe błędy `timeout waiting for request data` i sprawiło, że serwer nie potrzebuje klucza, który pozwala wgrać dowolną politykę na komputer.
 
 ---
 
@@ -150,13 +151,6 @@ sudo useradd --system --create-home --shell /bin/bash fwbackup
 sudo install -d -o fwbackup -g fwbackup -m 750 /etc/fwbackup /srv/fwbackups /var/lib/fwbackup/locks /var/log/fwbackup
 sudo -u fwbackup ssh-keygen -t ed25519 -N '' -C fwbackup-export -f /etc/fwbackup/id_export
 sudo -u fwbackup sh -c 'ssh-keyscan -t ed25519 10.0.2.20 > /etc/fwbackup/known_hosts'
-```
-
-Skrypty serwera (biblioteki muszą należeć do roota, żeby `fwbackup` nie mógł zmienić kodu, który wykonuje):
-
-```bash
-sudo install -d -m 755 /usr/local/lib/fwbackup
-sudo install -m 644 -o root -g root backup.sh restore.sh /usr/local/lib/fwbackup/
 sudo install -m 755 fw-server.sh /usr/local/bin/fw-server.sh
 ```
 
@@ -174,7 +168,7 @@ Opcjonalnie kopia co godzinę, w `/etc/cron.d/fwbackup`:
 
 ### 4.2 SFTPGo i uprawnienia plików
 
-SFTPGo działa jako użytkownik `sftpgo` i musi móc **czytać** kopie. Katalog z kopiami powinien mieć grupę `sftpgo` i bit setgid, żeby nowe pliki dziedziczyły grupę (nowy `fw-server.sh` zapisuje pliki właśnie tak):
+SFTPGo działa jako użytkownik `sftpgo` i musi móc **czytać** kopie. Katalog z kopiami powinien mieć grupę `sftpgo` i bit setgid, żeby nowe pliki dziedziczyły grupę:
 
 ```bash
 sudo chgrp sftpgo /srv/fwbackups/student /srv/fwbackups/student/backups
@@ -194,19 +188,19 @@ W panelu SFTPGo (użytkownik `student`):
 Układ plików:
 
 ```
-C:\FW\FirewallRules.ps1
+C:\FW\firewall.ps1
 C:\FW\backup\Backup-Create.ps1     tworzenie kopii, agent eksportu, lista
 C:\FW\backup\Backup-Restore.ps1    przywracanie
 ```
 
 ```powershell
 New-Item -ItemType Directory -Path C:\FW\backup -Force | Out-Null
-# skopiuj FirewallRules.ps1 do C:\FW oraz Backup-Create.ps1 i Backup-Restore.ps1 do C:\FW\backup
+# skopiuj firewall.ps1 do C:\FW oraz Backup-Create.ps1 i Backup-Restore.ps1 do C:\FW\backup
 icacls.exe C:\FW /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F"
 Get-ChildItem C:\FW -Recurse -Filter *.ps1 | Unblock-File
 ```
 
-Pliki w `backup\` działają z uprawnieniami administratora, dlatego skrypt odmówi ich wczytania, jeśli zwykły użytkownik ma prawo zapisu do tego katalogu.
+Pliki w `backup\` działają z uprawnieniami administratora, dlatego skrypt odmówi ich wczytania, jeśli zwykły użytkownik ma prawo zapisu do tego katalogu. Katalog `backup` musi leżeć **obok** `firewall.ps1`.
 
 ### 4.4 Windows – SSH i zapora
 
@@ -235,7 +229,7 @@ Copy-Item "$env:ProgramData\ssh\sshd_config" "$env:ProgramData\ssh\sshd_config.b
 Restart-Service sshd
 ```
 
-Zastrzeżenie: dopisz też adres, z którego sam administrujesz komputerem przez SSH, jeśli taki masz.
+Jeśli sam administrujesz komputerem przez SSH, dopisz w `AllowUsers` także swój adres.
 
 ### 4.5 Windows – klucz do rozmowy z serwerem
 
@@ -265,11 +259,15 @@ if ($exportPub -notmatch '^ssh-ed25519 AAAA\S{40,}') { throw 'Klucz wygląda na 
 
 $ak   = "$env:ProgramData\ssh\administrators_authorized_keys"
 $opts = 'no-port-forwarding,no-agent-forwarding,no-X11-forwarding,no-pty'
-$cmd  = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:/FW/FirewallRules.ps1 -Agent Export'
+$cmd  = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:/FW/firewall.ps1 -Agent Export'
 if (Test-Path $ak) { Copy-Item $ak "$ak.bak" -Force }
 $keep = @(); if (Test-Path $ak) { $keep = @(Get-Content $ak | Where-Object { $_ -notmatch 'FirewallRules\.ps1|firewall\.ps1' }) }
 Set-Content -Path $ak -Encoding ascii -Value ($keep + @("command=`"$cmd`",$opts $exportPub"))
 icacls.exe $ak /inheritance:r /grant "*S-1-5-18:F" /grant "*S-1-5-32-544:F"
 ```
 
-Ten plik obowiązuje, bo konto `Student` jest administratorem. Ścieżka w `command=` musi dokładnie wskazywać skrypt.
+Ten plik obowiązuje, bo konto `Student` jest administratorem. Ścieżka w `command=` musi dokładnie wskazywać `firewall.ps1`. Jeśli kiedyś był tu wpis `-Agent Import`, filtr powyżej go usuwa (tryb `Import` już nie istnieje).
+
+### 4.7 Windows – obserwator audytu
+
+Uruchom `firewall.ps1`, wybierz **8**, potem **I**. Po każdej zmianie `firewall.ps1` zainstaluj obserwatora ponownie.
