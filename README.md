@@ -1,5 +1,9 @@
 # Firewall w PowerShell
 
+[![CI](https://github.com/ruslanhedz/Firewall_in_powershell/actions/workflows/ci.yml/badge.svg)](https://github.com/ruslanhedz/Firewall_in_powershell/actions/workflows/ci.yml)
+![PowerShell](https://img.shields.io/badge/PowerShell-5.1%20Desktop-blue.svg)
+![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux-lightgrey.svg)
+
 Interaktywny skrypt do zarządzania regułami Zapory Windows z **audytem wszystkich zmian polityki zapory** (kto / co / kiedy / skąd).
 
 Wymagania: Windows PowerShell **5.1 (Desktop)**, uruchomienie jako administrator.
@@ -58,15 +62,34 @@ Pod menu widać stan: watcher (zainstalowany / nieaktywny / ostatni przebieg nie
 - Ochrona: **head hash**. Menu 8 → **H** pokazuje `<seq>:<skrót>` najnowszego rekordu. Zapisz go **poza tym komputerem** (e-mail, zgłoszenie, wydruk). Opcja 6 porównana z zapisaną wartością wykryje obcięcie i pełne przepisanie. Bez zewnętrznej kopii tego nie da się wykryć.
 - Administrator może też wyłączyć watchera lub wyczyścić dziennik zdarzeń; skutki widać jako brak udanego przebiegu (stan watchera) i luki w atrybucji, a nie jako blokadę.
 
-## Testy
+## Testy i CI/CD
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\tests\Test-FirewallAudit.ps1
-```
+Projekt posiada automatyczny pipeline CI/CD w **GitHub Actions** ([.github/workflows/ci.yml](.github/workflows/ci.yml)), który przy każdym commicie i pull requeście uruchamia testy na systemach Windows i Linux.
 
-Testy jednostkowe działają w piaskownicy (katalog tymczasowy, atrapa rejestru w HKCU, prywatny mutex); nie zmieniają prawdziwej polityki zapory i nie wymagają uprawnień administratora. Ostatnia sekcja tylko czyta prawdziwy magazyn polityki.
+### 1. Testy jednostkowe (uruchamiane lokalnie i w CI)
 
-Czego nie da się sprawdzić bez administratora (zadanie SYSTEM, prawdziwa ACL w `ProgramData`, atrybucja z dziennika zdarzeń) pokrywa **ręczny test akceptacyjny** – uruchamiany na maszynie testowej / w VM:
+Wszystkie testy jednostkowe działają w piaskownicy (katalogi tymczasowe, mocki, rejestr HKCU) i **nie modyfikują** rzeczywistej konfiguracji systemu ani nie wymagają uprawnień administratora:
+
+- **Audyt polityki i integralność łańcucha SHA-256 (oraz weryfikacja kontraktu AST):**
+  ```powershell
+  powershell -NoProfile -ExecutionPolicy Bypass -File .\tests\Test-FirewallAudit.ps1
+  ```
+- **Moduł kopii zapasowych i przywracania (walidacja kont, SHA-256, SFTP):**
+  ```powershell
+  powershell -NoProfile -ExecutionPolicy Bypass -File .\tests\Test-BackupModule.ps1
+  ```
+- **Interfejs CLI, walidacja danych wejściowych i generowanie nazw reguł:**
+  ```powershell
+  powershell -NoProfile -ExecutionPolicy Bypass -File .\tests\Test-CliHelpers.ps1
+  ```
+- **Serwer backupu Ubuntu (parsowanie klientów, retencja 30 kopii, sanityzacja):**
+  ```bash
+  bash ./tests/test-fw-server.sh
+  ```
+
+### 2. Ręczny test akceptacyjny E2E (wyłącznie na maszynie testowej / VM)
+
+Czego nie da się sprawdzić bez administratora (zadanie Scheduled Task jako SYSTEM, prawdziwa ACL w `ProgramData`, atrybucja z dziennika zdarzeń) pokrywa **ręczny test akceptacyjny** – uruchamiany na maszynie testowej / w VM:
 
 ```powershell
 # w oknie PowerShell 5.1 uruchomionym jako administrator
