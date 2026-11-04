@@ -11,8 +11,6 @@ Set-ExecutionPolicy Bypass -Scope Process -Force
 .\firewall.ps1
 ```
 
-> **Plik `FirewallRules.ps1` jest przestarzały.** To pierwsza wersja skryptu, bez audytu – nie należy go uruchamiać, bo zmienia politykę zapory poza `Invoke-AuditedChange`. Jedyny aktualny plik to `firewall.ps1` (usunięcie starego pliku jest przygotowane w indeksie git).
-
 ## Menu
 
 Numeracja jest stała (1–9). Nowe funkcje audytu trafiają do podmenu opcji 8, więc nikt nie musi renumerować własnych opcji.
