@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [ '**' ]
+  pull_request:
+    branches: [ '**' ]
+  workflow_dispatch:
+
+jobs:
+  windows-tests:
+    name: Windows Client & Core Tests
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: powershell
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run Audit & AST Unit Tests
+        run: |
+          Write-Host "Running Test-FirewallAudit.ps1..." -ForegroundColor Cyan
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests/Test-FirewallAudit.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Run Backup Module Unit Tests
+        run: |
+          Write-Host "Running Test-BackupModule.ps1..." -ForegroundColor Cyan
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests/Test-BackupModule.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Run CLI Helpers & Validation Unit Tests
+        run: |
+          Write-Host "Running Test-CliHelpers.ps1..." -ForegroundColor Cyan
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests/Test-CliHelpers.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Run PSScriptAnalyzer (Critical Errors & Syntax)
+        run: |
+          Write-Host "Running PSScriptAnalyzer (-Severity Error)..." -ForegroundColor Cyan
+          $issues = @(Invoke-ScriptAnalyzer -Path . -Severity Error -Recurse)
+          if ($issues.Count -gt 0) {
+              $issues | Format-Table -AutoSize
+              throw "PSScriptAnalyzer found $($issues.Count) critical error(s)!"
+          }
+          Write-Host "PSScriptAnalyzer passed: 0 critical errors found." -ForegroundColor Green
+
+  linux-server-tests:
+    name: Linux Backup Server Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Ensure ShellCheck is installed
+        run: command -v shellcheck >/dev/null || { sudo apt-get update && sudo apt-get install -y shellcheck; }
+
+      - name: Run ShellCheck on fw-server.sh
+        run: |
+          echo "Running shellcheck on fw-server.sh..."
+          sed -i 's/\r$//' fw-server.sh
+          shellcheck fw-server.sh || true
+          shellcheck --severity=error fw-server.sh
+
+      - name: Run Linux Server Unit Tests
+        run: |
+          echo "Running tests/test-fw-server.sh..."
+          sed -i 's/\r$//' tests/test-fw-server.sh
+          bash tests/test-fw-server.sh
+
