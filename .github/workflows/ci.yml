@@ -62,8 +62,7 @@ jobs:
         run: |
           echo "Running shellcheck on fw-server.sh..."
           sed -i 's/\r$//' fw-server.sh
-          shellcheck fw-server.sh || true
-          shellcheck --severity=error fw-server.sh
+          shellcheck fw-server.sh
 
       - name: Run Linux Server Unit Tests
         run: |

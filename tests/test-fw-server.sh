@@ -60,7 +60,9 @@ section "Client configuration & setup_user validation"
 cat << 'EOF' > "$CONF"
 student 10.0.2.20 Student
 john_doe 192.168.1.50 AdminUser
-bad_ip 10.0.2.notanip InvalidIpUser
+bad_ip 999.999.999.999 InvalidIpUser
+bad_octet 10.0.2.256 InvalidOctetUser
+bad_text_ip 10.0.2.notanip InvalidTextIpUser
 bad_user 10.0.2.25 Invalid!User*Name
 EOF
 
@@ -82,8 +84,10 @@ assert '! setup_user "student name"' "Space in username rejected"
 # Unregistered client
 assert '! setup_user "unknown_user"' "Unregistered client returns failure"
 
-# Malformed config entries in clients.conf (rejected by regex)
-assert '! setup_user "bad_ip"' "Client with non-numeric IP (10.0.2.notanip) rejected"
+# Malformed config entries in clients.conf (strictly validated)
+assert '! setup_user "bad_ip"' "Client with out-of-range IP (999.999.999.999) rejected"
+assert '! setup_user "bad_octet"' "Client with octet > 255 (10.0.2.256) rejected"
+assert '! setup_user "bad_text_ip"' "Client with non-numeric IP (10.0.2.notanip) rejected"
 assert '! setup_user "bad_user"' "Client with invalid Windows username rejected"
 
 # -----------------------------------------------------------------------------
@@ -120,15 +124,10 @@ section "Backup pruning (retention limit of 30 backups)"
 # Clean the store directory
 rm -rf "${STORE:?}"/*
 
-# Create 35 mock backups matching both auto and scheduled patterns
-for i in $(seq -w 1 25); do
+# Case 1: Only auto-add backups exist (no scheduled backups)
+for i in $(seq -w 1 35); do
     f="$STORE/PC_20261104_${i}0000_auto-add.wfw"
     echo "auto $i" > "$f"
-    touch -t "2026110400$i" "$f" "$f.sha256"
-done
-for i in $(seq -w 26 35); do
-    f="$STORE/PC_20261104_${i}0000_scheduled.wfw"
-    echo "scheduled $i" > "$f"
     touch -t "2026110400$i" "$f" "$f.sha256"
 done
 
@@ -137,7 +136,24 @@ PROTECT=""
 prune_backups
 
 REMAINING_COUNT=$(find "$STORE" -name "*.wfw" | wc -l)
-assert '[ "$REMAINING_COUNT" -eq 30 ]' "Pruning retained exactly 30 newest backups (from 35)"
+assert '[ "$REMAINING_COUNT" -eq 30 ]' "Pruning retained exactly 30 newest backups when only auto backups exist"
+
+# Case 2: Mixed auto-add and scheduled backups
+rm -rf "${STORE:?}"/*
+for i in $(seq -w 1 20); do
+    f="$STORE/PC_20261104_${i}0000_auto-add.wfw"
+    echo "auto $i" > "$f"
+    touch -t "2026110400$i" "$f" "$f.sha256"
+done
+for i in $(seq -w 21 35); do
+    f="$STORE/PC_20261104_${i}0000_scheduled.wfw"
+    echo "scheduled $i" > "$f"
+    touch -t "2026110400$i" "$f" "$f.sha256"
+done
+
+prune_backups
+REMAINING_COUNT=$(find "$STORE" -name "*.wfw" | wc -l)
+assert '[ "$REMAINING_COUNT" -eq 30 ]' "Pruning retained exactly 30 newest backups with mixed auto and scheduled types"
 
 # Verify PROTECT parameter prevents pruning of old backup during restore
 rm -rf "${STORE:?}"/*

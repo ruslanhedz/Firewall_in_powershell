@@ -43,7 +43,7 @@ setup_user() {
     line=$(awk -v u="$1" '$1==u {print $2" "$3; exit}' "$CONF" 2>/dev/null)
     HOST=${line%% *}
     WINUSER=${line#* }
-    [[ "$HOST" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    [[ "$HOST" =~ ^((25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])$ ]] || return 1
     [[ "$WINUSER" =~ ^[A-Za-z0-9._-]{1,32}$ ]] || return 1
     STORE="$BASE/$1/backups"
     mkdir -p "$STORE" "$LOCKDIR"
@@ -60,7 +60,9 @@ agent_ssh() {
 
 # Keeps the newest KEEP_AUTO auto-* / scheduled backups; never deletes $PROTECT (the backup being restored)
 prune_backups() {
-    ls -1t "$STORE"/*_auto-*.wfw "$STORE"/*_scheduled.wfw 2>/dev/null \
+    find "$STORE" -maxdepth 1 -type f \( -name "*_auto-*.wfw" -o -name "*_scheduled.wfw" \) -printf '%T@\t%p\n' 2>/dev/null \
+        | sort -k1,1rn \
+        | cut -f2- \
         | tail -n +$((KEEP_AUTO + 1)) \
         | while read -r f; do
             [ -n "$PROTECT" ] && [ "$(basename "$f")" = "$PROTECT" ] && continue
