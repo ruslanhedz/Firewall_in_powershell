@@ -23,7 +23,7 @@ KEEP_AUTO=30
 EXPORT_TRIES=3
 
 CUR_USER="?"; HOST=""; WINUSER=""; STORE=""; MODE_OUT=0
-BK_NAME=""; BK_SHA=""; BK_MSG=""; PROTECT=""
+BK_NAME=""; export BK_SHA=""; BK_MSG=""; PROTECT=""
 
 log() { printf '%s [%s] %s\n' "$(date -Is)" "$CUR_USER" "$*" >> "$LOG"; }
 
@@ -169,9 +169,9 @@ handle_request() { # $1 = sftp user
 
 # Scheduled mode (cron): pull a backup from each registered client
 run_scheduled() { # optional $1 = only this user
-    local only=${1:-} u h w rest
+    local only=${1:-} u _
     MODE_OUT=0
-    while read -r u h w rest; do
+    while read -r u _; do
         [[ -z "${u:-}" || "$u" == \#* ]] && continue
         [ -n "$only" ] && [ "$u" != "$only" ] && continue
         CUR_USER=$u
